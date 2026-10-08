@@ -19,7 +19,7 @@ let sceneHost = "local"
 
 /// The scenes the app can show, each a directory under scenes/ with a wallpaper.html.
 enum World: String, CaseIterable {
-  case riverscape, reefscape, bettascape, plasmascape, koiscape
+  case riverscape, reefscape, bettascape, plasmascape, koiscape, bonfirescape
 
   var title: String {
     switch self {
@@ -28,17 +28,19 @@ enum World: String, CaseIterable {
     case .bettascape: "Betta"
     case .plasmascape: "Plasma globe"
     case .koiscape: "Koi pond"
+    case .bonfirescape: "Bonfire"
     }
   }
-  /// Only worlds with something to eat have anything to feed.
+  /// Only worlds with something to eat have anything to feed; the bonfire is stirred instead.
   var canFeed: Bool { self != .plasmascape }
+  var feedTitle: String { self == .bonfirescape ? "Stir the Fire" : "Feed" }
   var page: String { "/scenes/\(rawValue)/wallpaper.html" }
   /// What shows before the page has drawn anything, matched to each scene's own dark.
   var background: NSColor {
     switch self {
     case .riverscape: NSColor(calibratedRed: 0.031, green: 0.055, blue: 0.047, alpha: 1)
     case .reefscape: NSColor(calibratedRed: 0.043, green: 0.094, blue: 0.145, alpha: 1)
-    case .bettascape, .plasmascape: .black
+    case .bettascape, .plasmascape, .bonfirescape: .black
     case .koiscape: NSColor(calibratedRed: 0.016, green: 0.024, blue: 0.02, alpha: 1)
     }
   }
@@ -606,6 +608,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Food that nothing is going to draw would sit unseen until the scene started
     // again and then all arrive at once, so Feed says so rather than promising a feeding.
     feed.isEnabled = applied > 0 && world.canFeed
+    feed.title = world.feedTitle
   }
 
   /// Every screen, because each one runs its own world rather than one

@@ -8,9 +8,9 @@ Deskworlds puts a small living 3D world on your Mac desktop. The creatures in ea
 
 | | |
 | --- | --- |
-| ![Riverbed](docs/images/riverscape-wide.png) **Riverbed**: a planted river with a school of fish | ![Coral reef](docs/images/reefscape-wide.png) **Coral reef**: clownfish and cleaner shrimp on a reef |
-| ![Betta](docs/images/bettascape-wide.png) **Betta**: a single halfmoon betta | ![Plasma globe](docs/images/plasmascape-wide.png) **Plasma globe**: a plasma lamp that reaches for your cursor |
-| ![Koi pond](docs/images/koiscape-wide.png) **Koi pond**: koi under lily pads, seen from above | |
+| ![Riverbed](docs/images/riverscape-wide.png) **Riverbed** | ![Coral reef](docs/images/reefscape-wide.png) **Coral reef** |
+| ![Betta](docs/images/bettascape-wide.png) **Betta** | ![Plasma globe](docs/images/plasmascape-wide.png) **Plasma globe** |
+| ![Koi pond](docs/images/koiscape-wide.png) **Koi pond** | ![Bonfire](docs/images/bonfirescape-wide.png) **Bonfire** |
 
 ## Install on Mac
 
@@ -26,7 +26,7 @@ To update, pull the latest source and run the installer again. To remove it, run
 
 ## Usage
 
-Click the Deskworlds icon in the menu bar to switch worlds, feed the creatures, or pause. Desktop icons and clicks work as usual.
+Click the Deskworlds icon in the menu bar to switch worlds, feed the creatures, stir the fire, or pause. Desktop icons and clicks work as usual.
 
 The wallpaper lowers its frame rate on battery or when windows cover the desktop, and stops when the desktop is hidden, the screen is locked, or Low Power Mode is on. It reads your cursor position and window sizes for this, but does not record keystrokes or request any special permissions.
 
