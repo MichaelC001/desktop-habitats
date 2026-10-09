@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import {
-  NOISE, HEAT, SURFACE_VERT_PARS, SURFACE_VERT, SURFACE_FRAG_PARS, GROUND, LOGS, RUBBLE, SWORD, BONE, GRASS,
+  NOISE, HEAT, SURFACE_VERT_PARS, SURFACE_VERT, SURFACE_FRAG_PARS, GROUND, WOOD_PARS, WOOD, WOOD_BAKE_VERT, WOOD_BAKE_FRAG, LOGS, RUBBLE, SWORD, BONE, GRASS,
   FULLSCREEN_VERT, FLAME_FRAG, GROUND_BAKE, SPARK_VERT, SPARK_FRAG, COMPOSITE_FRAG, DOWN_FRAG, UP_FRAG, OUTPUT_FRAG,
 } from './shaders.js';
 import { buildWorld } from './world.js';
@@ -13,7 +13,7 @@ const LEVELS = 6;
 const BLOOM = { weights: [0.5, 0.15, 0.04, 0.01, 0.0], gain: 0.025 };
 const EXPOSURE = 1.15;
 // The flame is soft enough to march at reduced resolution and filter up.
-const FLAME_SCALE = 0.7;
+const FLAME_SCALE = 0.6;
 // Firelight is a few thousand kelvin: deep orange, a little yellower in the bright core.
 // Where the flames rise from: [x, z, radius, height] for each tongue.
 const SOURCES = [
@@ -22,6 +22,17 @@ const SOURCES = [
 ];
 const FIRE_LIGHT = new THREE.Color().setRGB(1.0, 0.5, 0.22, THREE.LinearSRGBColorSpace);
 
+// Point-light shadows filtered with five taps, not three.js's nine: the centre and four
+// alternate corners of the cube it samples around. The penumbrae are wide and soft, so the
+// coarser filter hardly shows, and every lit pixel pays for it once per light.
+const SHADOW_FILTER = (() => {
+  const chunk = THREE.ShaderChunk.shadowmap_pars_fragment, at = chunk.indexOf('vec2 offset = vec2( - 1, 1 )');
+  const point = chunk.slice(at)
+    .replace(/\t*texture2DCompare\( shadowMap, cubeToUV\( bd3D \+ offset\.(xyy|yyx|xxx|yxy), texelSize\.y \), dp \) \+\n/g, '')
+    .replace('( 1.0 / 9.0 )', '( 1.0 / 5.0 )');
+  return chunk.slice(0, at) + point;
+})();
+
 function patched(name, fragment, { axis = false, uniforms }) {
   const material = new THREE.MeshStandardMaterial({ roughness: 1, metalness: 0 });
   // Three caches programs by the patch function's source, which is the same for every surface.
@@ -29,6 +40,7 @@ function patched(name, fragment, { axis = false, uniforms }) {
   if (axis) material.defines = { HAS_AXIS: '' };
   material.onBeforeCompile = shader => {
     Object.assign(shader.uniforms, uniforms);
+    shader.fragmentShader = shader.fragmentShader.replace('#include <shadowmap_pars_fragment>', SHADOW_FILTER);
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', `#include <common>\n${SURFACE_VERT_PARS}`)
       .replace('#include <worldpos_vertex>', `#include <worldpos_vertex>\n${SURFACE_VERT}`);
@@ -70,7 +82,18 @@ export function createRenderer(canvas, fire) {
   });
   groundMap.texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
   mesh(world.ground, patched('ground', GROUND, { uniforms: { ...shared, uGroundMap: { value: groundMap.texture } } }), { cast: false });
-  mesh(world.logs, patched('logs', LOGS, { axis: true, uniforms: shared }));
+  // The logs' detail is costly and fixed, so it is drawn once into a per-pixel cache (the
+  // front-most log's normal, height and crack; its cell, burn, ash and key) and redrawn only
+  // when the view changes.
+  const wood = new THREE.WebGLRenderTarget(1, 1, { count: 2, type: THREE.HalfFloatType });
+  wood.textures[1].type = THREE.UnsignedByteType;
+  let woodStale = true;
+  mesh(world.logs, patched('logs', `${WOOD_PARS}\n${LOGS}`, { axis: true, uniforms: { ...shared, uWood: { value: wood.textures } } }));
+  const woodScene = new THREE.Scene();
+  woodScene.add(new THREE.Mesh(world.logs, new THREE.ShaderMaterial({
+    defines: { HAS_AXIS: '' }, vertexShader: WOOD_BAKE_VERT,
+    fragmentShader: `${SURFACE_FRAG_PARS}\n${NOISE}\n${WOOD_PARS}\n${WOOD}\n${WOOD_BAKE_FRAG}`,
+  })));
   mesh(world.rubble, patched('rubble', RUBBLE, { uniforms: shared }));
   mesh(world.sword, patched('sword', SWORD, { axis: true, uniforms: shared }));
   mesh(world.bones, patched('bone', BONE, { axis: true, uniforms: shared }));
@@ -90,6 +113,7 @@ export function createRenderer(canvas, fire) {
     light.shadow.normalBias = 0.01;
     light.shadow.radius = 8;
     light.shadow.blurSamples = 16;
+    light.shadow.autoUpdate = false;
     scene.add(light);
     return light;
   });
@@ -160,7 +184,7 @@ export function createRenderer(canvas, fire) {
     bake.scene.traverse(o => { o.geometry?.dispose(); o.material?.dispose(); });
   }
   const size = new THREE.Vector2(1, 1);
-  let frame = 0;
+  let frame = 0, shadowTime = -Infinity;
   const projected = new V3();
 
   // yaw (radians) and zoom move the camera around and toward the fire, for scripted captures.
@@ -175,6 +199,7 @@ export function createRenderer(canvas, fire) {
     camera.lookAt(HOME.target);
     camera.updateMatrixWorld();
     camera.updateProjectionMatrix();
+    woodStale = true;
     composite.u.uAspect.value = output.u.uAspect.value = aspect;
     // The shimmer sits over the flames.
     projected.set(0, 0.25, 0).project(camera);
@@ -226,9 +251,19 @@ export function createRenderer(canvas, fire) {
         radius, height * (1 + 0.25 * p) * s.energy * gutter);
     });
     placeLights();
+    // The lights move only a little from one frame to the next, so each frame redraws one
+    // shadow map in turn, and every one after a jump in time.
+    const jump = Math.abs(s.time - shadowTime) > 0.1;
+    shadowTime = s.time;
+    lights.forEach((light, i) => { if (jump || frame % lights.length === i) light.shadow.needsUpdate = true; });
     sparkBuffer.needsUpdate = true;
     sparkMaterial.uniforms.uStepRate.value = 1 / Math.max(1e-4, s.step);
 
+    if (woodStale) {
+      renderer.setRenderTarget(wood);
+      renderer.render(woodScene, camera);
+      woodStale = false;
+    }
     renderer.setRenderTarget(hdr);
     renderer.clear();
     renderer.render(scene, camera);
@@ -265,6 +300,7 @@ export function createRenderer(canvas, fire) {
     renderer.setSize(w, h, false);
     size.set(w, h);
     hdr.setSize(w, h);
+    wood.setSize(w, h);
     const fw = Math.ceil(w * FLAME_SCALE), fh = Math.ceil(h * FLAME_SCALE);
     flameRT.setSize(fw, fh);
     composite.u.uFlameTexel.value.set(1 / fw, 1 / fh);
@@ -280,12 +316,12 @@ export function createRenderer(canvas, fire) {
 
   function dispose() {
     const geometries = new Set(), materials = new Set();
-    for (const root of [scene, flame.scene, composite.scene, down.scene, up.scene, output.scene]) {
+    for (const root of [scene, woodScene, flame.scene, composite.scene, down.scene, up.scene, output.scene]) {
       root.traverse(o => { if (o.geometry) geometries.add(o.geometry); if (o.material) materials.add(o.material); });
     }
     geometries.forEach(g => g.dispose());
     materials.forEach(m => m.dispose());
-    for (const rt of [hdr, flameRT, compRT, groundMap, ...downs, ...ups]) rt.dispose();
+    for (const rt of [hdr, wood, flameRT, compRT, groundMap, ...downs, ...ups]) rt.dispose();
     for (const light of lights) light.shadow.map?.dispose();
     renderer.dispose();
   }
