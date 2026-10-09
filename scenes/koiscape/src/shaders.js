@@ -65,18 +65,31 @@ const vec3 SKY_LIGHT = vec3(0.92, 0.98, 0.96);                 // what an upturn
 const vec3 SKY_BRIGHT = vec3(0.7, 0.82, 1.0) * 3.0;
 const vec3 LEAF_DARK = vec3(0.008, 0.016, 0.008);
 const float CANOPY_HEIGHT = 3.2;
-float canopy(vec2 q) {
-  q += 0.05 * vec2(sin(uTime * 0.31 + q.y * 1.7), cos(uTime * 0.27 + q.x * 1.3));    // a breeze in the leaves
+// A breeze in the leaves.
+vec2 breeze(vec2 q) { return 0.05 * vec2(sin(uTime * 0.31 + q.y * 1.7), cos(uTime * 0.27 + q.x * 1.3)); }
+// The leaves before they are cut out against the sky, with the breeze not yet in them.
+float leafField(vec2 q) {
   float n = fbm5(q * 0.7 + vec2(3.7, 1.9));
   // Where the crowns thin out, sky shows through as many small gaps between clusters of leaves.
   float open = 1.0 - smoothstep(0.36, 0.52, n);
   float holes = fbm3(mat2(0.6, -0.8, 0.8, 0.6) * q * 4.0 + 7.0) + 0.3 * (vnoise(q * 16.0 + 2.0) - 0.5) + 0.12 * (vnoise(q * 43.0 + 5.0) - 0.5);
-  return smoothstep(0.42, 0.6, holes + (1.0 - open) * 0.5);
+  return holes + (1.0 - open) * 0.5;
+}
+float canopy(vec2 q) { return smoothstep(0.42, 0.6, leafField(q + breeze(q))); }
+uniform sampler2D uSunMap;                  // sunField, laid once per framing: see SUN_FRAG
+uniform vec2 uSunHalf;                      // half extents of the water it covers
+// The gaps the sun comes through, as they fall on the water at xz before the breeze moves them
+// and before they are cut out.
+float sunField(vec2 xz) {
+  vec2 q = xz + SUN_DIR.xz / SUN_DIR.y * CANOPY_HEIGHT;
+  return fbm3(mat2(0.8, 0.6, -0.6, 0.8) * (q * 0.7) + vec2(3.7, 1.9));
 }
 // How much direct sun reaches the water at xz: soft, because the gaps are far overhead.
 float sunPatch(vec2 xz) {
   vec2 q = xz + SUN_DIR.xz / SUN_DIR.y * CANOPY_HEIGHT;
-  float n = fbm3(mat2(0.8, 0.6, -0.6, 0.8) * (q * 0.7) + vec2(3.7, 1.9) + 0.02 * sin(uTime * 0.3 + q.yx));
+  // The breeze sways the noise; carried back to the water, that turns the other way.
+  vec2 sway = 0.02 * sin(uTime * 0.3 + q.yx) * mat2(0.8, 0.6, -0.6, 0.8) / 0.7;
+  float n = texture2D(uSunMap, (xz + sway) / (2.0 * uSunHalf) + 0.5).r;
   return 1.0 - smoothstep(0.33, 0.46, n);
 }
 `;
@@ -109,23 +122,48 @@ vec3 display(vec3 hdr) {
 // those stay dark (hush).
 const MIRROR = /* glsl */`
 uniform vec2 uHalf;                         // half extents of the water in view
+uniform sampler2D uOverhead;                // the noise behind the reflection, laid once: see OVERHEAD_FRAG
+uniform vec2 uOverheadHalf;                 // half extents of the canopy it covers
 float hushAt(vec2 xz) {
   vec2 frame = xz / uHalf;
   return max(smoothstep(-0.6, -0.85, frame.y), smoothstep(0.6, 0.8, frame.x));
 }
+vec4 overheadAt(vec2 q) { return texture2D(uOverhead, q / (2.0 * uOverheadHalf) + 0.5); }
 vec3 mirrored(vec2 q, vec3 n, float hush, out float leaves) {
-  leaves = max(canopy(q), hush);
-  vec3 sky = SKY_BRIGHT * (0.3 + 1.0 * smoothstep(0.2, 0.8, fbm3(q * 0.9 + 3.0)));
+  vec4 above = overheadAt(q);
+  leaves = max(smoothstep(0.42, 0.6, overheadAt(q + breeze(q)).r), hush);
+  vec3 sky = SKY_BRIGHT * (0.3 + 1.0 * smoothstep(0.2, 0.8, above.g));
   // The brightest sky is toward the sun: facets tilted that way catch it, so every ring and
   // ripple is lit on one side.
   sky *= 1.0 + 3.0 * max(0.0, dot(-n.xz, normalize(SUN_DIR.xz)));
   // Leaves overhead: mostly in their own shade, a few lit through by the sun.
-  vec2 lq = mat2(0.8, -0.6, 0.6, 0.8) * q;
-  float lit = smoothstep(0.55, 0.75, fbm3(lq * 4.0 + 1.7) + 0.25 * (vnoise(lq * 23.0) - 0.5)) * (1.0 - hush * 0.8);
-  vec3 foliage = LEAF_DARK + (vec3(0.1, 0.15, 0.06) * fbm3(lq * 11.0) + vec3(0.25, 0.32, 0.1) * lit) * (1.0 - hush * 0.85);
+  float lit = smoothstep(0.55, 0.75, above.b) * (1.0 - hush * 0.8);
+  vec3 foliage = LEAF_DARK + (vec3(0.1, 0.15, 0.06) * above.a + vec3(0.25, 0.32, 0.1) * lit) * (1.0 - hush * 0.85);
   // Sky seen past the leaves picks up a little of their green.
   return mix(mix(sky, sky * vec3(0.85, 1.0, 0.8), 0.35) * 1.2, foliage, leaves);
 }
+`;
+
+// The still noise behind what the water mirrors, laid once per framing over the canopy a little
+// past the frame, so a reflection costs two lookups: the leaves (r, before the breeze moves them
+// and before they are cut out), the brightness of the sky (g), the leaves the sun lights (b, before
+// they are cut out) and the shading of the rest (a).
+export const OVERHEAD_FRAG = /* glsl */`
+${SKY}
+uniform vec2 uOverheadHalf;
+varying vec2 vUv;
+void main() {
+  vec2 q = (vUv - 0.5) * 2.0 * uOverheadHalf;
+  vec2 lq = mat2(0.8, -0.6, 0.6, 0.8) * q;
+  gl_FragColor = vec4(leafField(q), fbm3(q * 0.9 + 3.0), fbm3(lq * 4.0 + 1.7) + 0.25 * (vnoise(lq * 23.0) - 0.5), fbm3(lq * 11.0));
+}
+`;
+
+// The pools of sun on the water, laid once per framing a little past what the bottom shows.
+export const SUN_FRAG = /* glsl */`
+${SKY}
+varying vec2 vUv;
+void main() { gl_FragColor = vec4(sunField((vUv - 0.5) * 2.0 * uSunHalf), 0.0, 0.0, 1.0); }
 `;
 
 // The ripple field, for things drawn on the surface that ride it: height in metres at a point
@@ -582,6 +620,8 @@ void main() {
 
 // The bottom: silt and a scatter of stones, lost in the dark of the deep water, coming up into a
 // shelf of stones under the pads where the caustic light and the shadows of pads and fish move.
+// None of it moves but the light, so the stones and silt are laid once per framing into two
+// screen-sized pictures (BAKE 1: colour and depth, BAKE 2: stones) and only lit each frame.
 export const BOTTOM_VERT = /* glsl */`
 varying vec3 vWorld;
 void main() {
@@ -593,16 +633,20 @@ export const BOTTOM_FRAG = /* glsl */`
 ${UNDERWATER}
 uniform vec4 uShadow[30];                  // xz, radius and depth of three points down each fish
 uniform int uShadowCount;
+uniform sampler2D uBed;
+uniform sampler2D uBedStones;
+uniform vec2 uRes;
 varying vec3 vWorld;
 void main() {
   vec2 p = vWorld.xz;
+  vec2 sp = p * 6.0 + 1.3;
+  vec2 cell = floor(sp), f = fract(sp) - 0.5;
+#ifdef BAKE
   // Shelves of stones rise toward the lower left and along the bottom edge, where the pads grow;
   // the middle of the pond falls away into the dark.
   float shelf = smoothstep(1.7, 0.1, length((p - vec2(-uFieldHalf.x * 0.95, uFieldHalf.y * 0.9)) * vec2(0.6, 1.0)));
   shelf = max(shelf, 0.7 * smoothstep(0.75, 0.0, length((p - vec2(uFieldHalf.x * 0.05, uFieldHalf.y * 1.05)) * vec2(0.5, 1.3))));
   float lumps = fbm5(p * 2.3 + 5.0);
-  vec2 sp = p * 6.0 + 1.3;
-  vec2 cell = floor(sp), f = fract(sp) - 0.5;
   vec2 jitter = hash22(cell) - 0.5;
   float pebble = smoothstep(0.4, 0.22, length((f - jitter * 0.3) * (0.8 + 0.5 * hash22(cell + 2.0))) + 0.22 * vnoise(p * 14.0) + 0.08 * vnoise(p * 45.0));
   float stones = pebble * step(0.45, hash21(cell + 4.0)) * smoothstep(0.35, 0.6, fbm3(p * 1.7));
@@ -613,6 +657,12 @@ void main() {
   albedo *= 0.8 + 0.4 * vnoise(p * 40.0);
   // Fallen leaves, here and there.
   albedo = mix(albedo, vec3(0.14, 0.075, 0.025), smoothstep(0.8, 0.86, vnoise(p * 11.0 + 40.0)) * 0.6);
+  gl_FragColor = BAKE == 1 ? vec4(albedo, depth) : vec4(stones, 0.0, 0.0, 1.0);
+#else
+  vec2 uv = gl_FragCoord.xy / uRes;
+  vec4 bed = texture2D(uBed, uv);
+  vec3 albedo = bed.rgb;
+  float depth = bed.a, stones = texture2D(uBedStones, uv).r;
   // Deep down the murk swallows caustics and fish shadows alike: skip them there.
   if (depth > 0.95) {
     float sunHere = sunPatch(p) * padShade(p, 0.06);
@@ -634,6 +684,7 @@ void main() {
   }
   light *= mix(1.0, shadow, 0.85);
   gl_FragColor = vec4(throughWater(albedo * light, depth), depth);
+#endif
 }
 `;
 
@@ -674,6 +725,45 @@ void main() {
 }
 `;
 
+// The small chop on the water: smooth enough to work out at half the resolution of the frame, so
+// it is, into a target the surface reads back. The slope in xy, the fine octaves in zw.
+export const CHOP_FRAG = /* glsl */`
+${NOISE}
+uniform float uTime;
+uniform vec2 uHalf;
+varying vec2 vUv;
+// The broad part of the slope comes back; the fine octaves, which only the reflection needs, go
+// in fine (scattering the refraction lookups that finely would also defeat the texture cache).
+vec2 chop(vec2 p, float t, out vec2 fine) {
+  // A handful of small wave trains crossing each other, bent a little so they never line up.
+  // Bent well off straight, so crossing trains never set up a lattice.
+  p += 0.22 * vec2(vnoise(p * 1.1 + t * 0.05), vnoise(p * 1.1 + 9.0 - t * 0.04)) + 0.06 * vec2(vnoise(p * 4.0 - t * 0.1), vnoise(p * 4.0 + 5.0));
+  vec2 g = vec2(0.0);
+  g += vec2(0.92, 0.39) * 0.016 * cos(dot(p, vec2(0.92, 0.39)) * 19.0 - t * 2.9);
+  g += vec2(-0.5, 0.87) * 0.013 * cos(dot(p, vec2(-0.5, 0.87)) * 27.0 - t * 3.6 + 1.3);
+  g += vec2(0.26, -0.97) * 0.011 * cos(dot(p, vec2(0.26, -0.97)) * 41.0 - t * 4.6 + 4.1);
+  g += vec2(-0.81, -0.59) * 0.008 * cos(dot(p, vec2(-0.81, -0.59)) * 63.0 - t * 5.9 + 2.2);
+  g += vec2(0.71, 0.71) * 0.03 * cos(dot(p, vec2(0.71, 0.71)) * 6.5 - t * 1.5 + 0.7);
+  g += vec2(-0.2, 0.98) * 0.025 * cos(dot(p, vec2(-0.2, 0.98)) * 4.3 - t * 1.1 + 2.0);
+  // Most of the roughness is no wave train at all but a drifting, irregular field: the slope of a
+  // few octaves of noise, each sliding its own way, so nothing in it ever lines up.
+  vec2 n = vec2(0.0);
+  fine = vec2(0.0);
+  n = vnoiseD(p * 7.0 + vec2(t * 0.35, -t * 0.27)).yz * 0.0045;
+  fine = vnoiseD(p * 16.1 + vec2(t * 1.1, -t * 0.54)).yz * 0.0028 + vnoiseD(p * 37.0 + vec2(t * 1.65, -t * 0.81)).yz * 0.0018;
+  // Breaths of wind roughen the water in patches that drift across the pond.
+  float gust = 0.45 + 1.6 * smoothstep(0.3, 0.75, vnoise(p * 0.45 + vec2(t * 0.06, -t * 0.03)));
+  fine *= gust;
+  return (g * 0.35 + n) * gust;
+}
+void main() {
+  vec2 xz = vec2(vUv.x * 2.0 - 1.0, 1.0 - vUv.y * 2.0) * uHalf;
+  vec2 fine;
+  vec2 slope = chop(xz, uTime, fine);
+  gl_FragColor = vec4(slope, fine);
+}
+`;
+
 // The surface, seen from above. Slopes come from the ripple field plus a restless small chop;
 // they bend the view of what is underneath and swing the reflection of sky and leaves about.
 export const SURFACE_FRAG = /* glsl */`
@@ -686,6 +776,7 @@ uniform sampler2D uPadMask;
 uniform vec2 uFieldHalf;
 uniform vec2 uTexel;
 uniform float uCalm;
+uniform sampler2D uChop;                    // the small chop, from CHOP_FRAG
 uniform vec4 uSplash[8];                    // x, z, age and size of each place a mouth broke the surface
 uniform int uSplashCount;
 varying vec2 vUv;
@@ -721,31 +812,6 @@ vec3 bubbles(vec2 xz, float sun) {
   return add;
 }
 
-// The broad part of the slope comes back; the fine octaves, which only the reflection needs, go
-// in fine (scattering the refraction lookups that finely would also defeat the texture cache).
-vec2 chop(vec2 p, float t, out vec2 fine) {
-  // A handful of small wave trains crossing each other, bent a little so they never line up.
-  // Bent well off straight, so crossing trains never set up a lattice.
-  p += 0.22 * vec2(vnoise(p * 1.1 + t * 0.05), vnoise(p * 1.1 + 9.0 - t * 0.04)) + 0.06 * vec2(vnoise(p * 4.0 - t * 0.1), vnoise(p * 4.0 + 5.0));
-  vec2 g = vec2(0.0);
-  g += vec2(0.92, 0.39) * 0.016 * cos(dot(p, vec2(0.92, 0.39)) * 19.0 - t * 2.9);
-  g += vec2(-0.5, 0.87) * 0.013 * cos(dot(p, vec2(-0.5, 0.87)) * 27.0 - t * 3.6 + 1.3);
-  g += vec2(0.26, -0.97) * 0.011 * cos(dot(p, vec2(0.26, -0.97)) * 41.0 - t * 4.6 + 4.1);
-  g += vec2(-0.81, -0.59) * 0.008 * cos(dot(p, vec2(-0.81, -0.59)) * 63.0 - t * 5.9 + 2.2);
-  g += vec2(0.71, 0.71) * 0.03 * cos(dot(p, vec2(0.71, 0.71)) * 6.5 - t * 1.5 + 0.7);
-  g += vec2(-0.2, 0.98) * 0.025 * cos(dot(p, vec2(-0.2, 0.98)) * 4.3 - t * 1.1 + 2.0);
-  // Most of the roughness is no wave train at all but a drifting, irregular field: the slope of a
-  // few octaves of noise, each sliding its own way, so nothing in it ever lines up.
-  vec2 n = vec2(0.0);
-  fine = vec2(0.0);
-  n = vnoiseD(p * 7.0 + vec2(t * 0.35, -t * 0.27)).yz * 0.0045;
-  fine = vnoiseD(p * 16.1 + vec2(t * 1.1, -t * 0.54)).yz * 0.0028 + vnoiseD(p * 37.0 + vec2(t * 1.65, -t * 0.81)).yz * 0.0018;
-  // Breaths of wind roughen the water in patches that drift across the pond.
-  float gust = 0.45 + 1.6 * smoothstep(0.3, 0.75, vnoise(p * 0.45 + vec2(t * 0.06, -t * 0.03)));
-  fine *= gust;
-  return (g * 0.35 + n) * gust;
-}
-
 vec4 underAt(vec2 uv, vec2 shift) {
   vec4 c = texture2D(uUnder, uv + shift);
   c.r = texture2D(uUnder, uv + shift * 0.95).r;
@@ -761,9 +827,8 @@ void main() {
   float hz = texture2D(uRipple, fuv - vec2(0.0, uTexel.y)).r - texture2D(uRipple, fuv + vec2(0.0, uTexel.y)).r;
   vec2 cell = 2.0 * uFieldHalf * uTexel;
   vec2 rings = vec2(hx / (2.0 * cell.x), hz / (2.0 * cell.y));
-  vec2 fine;
-  vec2 slope = rings + chop(xz, uTime, fine) * uCalm;
-  fine *= uCalm;
+  vec4 chopped = texture2D(uChop, vUv);
+  vec2 slope = rings + chopped.xy * uCalm, fine = chopped.zw * uCalm;
   vec3 n = normalize(vec3(-(slope.x + fine.x), 1.0, -(slope.y + fine.y)));
 
   // Refraction: the deeper a thing lies, the further a slope carries its image, and the more

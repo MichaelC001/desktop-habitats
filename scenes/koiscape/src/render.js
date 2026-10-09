@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import {
-  BODY_VERT, BODY_FRAG, FIN_VERT, FIN_FRAG, BOTTOM_VERT, BOTTOM_FRAG, QUAD_VERT, RIPPLE_FRAG, SURFACE_FRAG,
+  BODY_VERT, BODY_FRAG, FIN_VERT, FIN_FRAG, BOTTOM_VERT, BOTTOM_FRAG, QUAD_VERT, RIPPLE_FRAG, SURFACE_FRAG, OVERHEAD_FRAG, CHOP_FRAG, SUN_FRAG,
   PAD_VERT, PAD_FRAG, PAD_MASK_FRAG, PETAL_VERT, PETAL_FRAG, PELLET_VERT, PELLET_FRAG,
 } from './shaders.js';
 import { bodyGeometry, finGeometry, padGeometry, petalGeometry, halfWidth, VARIETIES } from './koi.js';
@@ -11,6 +11,8 @@ import { POND_DEPTH, PELLET, SPINE_JOINTS, SPINE_SPAN, STROKE, RIPPLE_SPEED, FIX
 export const VIEW = { fov: 22, halfHeight: 1.1 };
 const FIELD_MARGIN = 0.35;                 // the ripple field runs this far past the frame
 const FIELD_WIDTH = 1024;
+const OVERHEAD_MARGIN = 1.0, OVERHEAD_TEXELS = 256;   // how far past the frame the mirrored canopy is laid, and how finely, per metre
+const SUN_TEXELS = 48;                     // the pools of sun are broad: this many texels a metre is plenty
 const EXPOSURE = 1.0;
 const MAX_PADS = 64, MAX_PETALS = 160;
 
@@ -41,8 +43,18 @@ export function createRenderer(canvas, pond) {
   const fieldHalf = new THREE.Vector2(3, 1.5), viewHalf = new THREE.Vector2(2.6, 1.1);
   const time = { value: 0 };
   const padMask = new THREE.WebGLRenderTarget(FIELD_WIDTH, 440, { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false });
-  const light = { uTime: time, uPadMask: { value: padMask.texture }, uFieldHalf: { value: fieldHalf } };
+  // Half-float pictures that are read back filtered: the ripple field, and those laid in advance.
+  const smooth = { type: THREE.HalfFloatType, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false };
+  // The pools of sun on the water, laid once per framing (see SUN_FRAG).
+  const sunTarget = new THREE.WebGLRenderTarget(1, 1, smooth);
+  const light = {
+    uTime: time, uPadMask: { value: padMask.texture }, uFieldHalf: { value: fieldHalf },
+    uSunMap: { value: sunTarget.texture }, uSunHalf: { value: new THREE.Vector2(1, 1) },
+  };
   const look = { uExposure: { value: EXPOSURE }, uFrame: { value: 0 }, uRes: { value: new THREE.Vector2(1, 1) }, uHalf: { value: viewHalf } };
+  // The canopy the water mirrors, laid once per framing (see OVERHEAD_FRAG).
+  const overheadTarget = new THREE.WebGLRenderTarget(1, 1, smooth);
+  const overhead = { uOverhead: { value: overheadTarget.texture }, uOverheadHalf: { value: new THREE.Vector2(1, 1) } };
   // The ripple field, for the surface and for everything that floats on it.
   const rippleTexel = new THREE.Vector2(1 / FIELD_WIDTH, 1 / 440);
   const field = { uRipple: { value: null }, uFieldHalf: light.uFieldHalf, uTexel: { value: rippleTexel } };
@@ -57,9 +69,21 @@ export function createRenderer(canvas, pond) {
   // --- Under the surface: the bottom, then every fish.
   const under = new THREE.Scene();
   const shadows = Array.from({ length: 30 }, () => new THREE.Vector4());
-  const bottom = meshOf(under, new THREE.PlaneGeometry(40, 40).rotateX(-Math.PI / 2).translate(0, -POND_DEPTH, 0), new THREE.ShaderMaterial({
-    uniforms: { ...light, uShadow: { value: shadows }, uShadowCount: { value: 0 } }, vertexShader: BOTTOM_VERT, fragmentShader: BOTTOM_FRAG,
-  }), -10);
+  // The bed itself never moves: it is laid once per framing into bed and bedStones, pixel for pixel
+  // with the under target, and the bottom pass each frame only lights it.
+  const exact = { minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, depthBuffer: false };
+  const bed = new THREE.WebGLRenderTarget(1, 1, { ...exact, type: THREE.HalfFloatType });
+  const bedStones = new THREE.WebGLRenderTarget(1, 1, { ...exact, format: THREE.RedFormat });
+  const bedUniforms = {
+    ...light, uShadow: { value: shadows }, uShadowCount: { value: 0 },
+    uBed: { value: bed.texture }, uBedStones: { value: bedStones.texture }, uRes: look.uRes,
+  };
+  const bottomShape = new THREE.PlaneGeometry(40, 40).rotateX(-Math.PI / 2).translate(0, -POND_DEPTH, 0);
+  const bottom = meshOf(under, bottomShape, new THREE.ShaderMaterial({ uniforms: bedUniforms, vertexShader: BOTTOM_VERT, fragmentShader: BOTTOM_FRAG }), -10);
+  const bedScene = new THREE.Scene();
+  const bakes = [1, 2].map((n) => new THREE.ShaderMaterial({ uniforms: bedUniforms, defines: { BAKE: n }, vertexShader: BOTTOM_VERT, fragmentShader: BOTTOM_FRAG, depthTest: false, depthWrite: false }));
+  const bedMesh = meshOf(bedScene, bottomShape, bakes[0]);
+  let laid = false;                         // whether the bed, overhead and sun pictures hold the current framing
   const bodyShape = bodyGeometry(), finShape = finGeometry();
   const koi = pond.fish.map((fish) => {
     const variety = VARIETIES[fish.variety], fins = FIN_LOOK[fish.variety];
@@ -98,13 +122,16 @@ export function createRenderer(canvas, pond) {
   // --- On the surface: the water itself, then pads, flowers and pellets.
   const over = new THREE.Scene();
   const underTarget = new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, samples: 0 });
-  const rippleOptions = { type: THREE.HalfFloatType, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false };
-  let ripples = [new THREE.WebGLRenderTarget(FIELD_WIDTH, 440, rippleOptions), new THREE.WebGLRenderTarget(FIELD_WIDTH, 440, rippleOptions)];
+  let ripples = [new THREE.WebGLRenderTarget(FIELD_WIDTH, 440, smooth), new THREE.WebGLRenderTarget(FIELD_WIDTH, 440, smooth)];
   field.uRipple.value = ripples[0].texture;
   const quad = new THREE.PlaneGeometry(2, 2);
+  // The small chop, worked out at half resolution (see CHOP_FRAG).
+  const chopTarget = new THREE.WebGLRenderTarget(1, 1, smooth);
+  const chopScene = new THREE.Scene();
+  meshOf(chopScene, quad, new THREE.ShaderMaterial({ uniforms: { uTime: time, uHalf: look.uHalf }, vertexShader: QUAD_VERT, fragmentShader: CHOP_FRAG, depthTest: false, depthWrite: false }));
   const surface = meshOf(over, quad, new THREE.ShaderMaterial({
     uniforms: {
-      ...light, ...look, ...field, uUnder: { value: underTarget.texture }, uCalm: { value: 1 }, uSplash: { value: splashes }, uSplashCount: { value: 0 },
+      ...light, ...look, ...field, ...overhead, uUnder: { value: underTarget.texture }, uChop: { value: chopTarget.texture }, uCalm: { value: 1 }, uSplash: { value: splashes }, uSplashCount: { value: 0 },
     },
     vertexShader: QUAD_VERT, fragmentShader: SURFACE_FRAG, depthTest: false, depthWrite: false,
   }), -10);
@@ -116,7 +143,7 @@ export function createRenderer(canvas, pond) {
   padShape.setAttribute('iLook', padLook);
   // Alpha to coverage softens the leaf's own outline, nicks and holes, which the canvas multisampling
   // alone would leave stepped.
-  meshOf(over, padShape, new THREE.ShaderMaterial({ uniforms: { ...light, ...look, ...field }, vertexShader: PAD_VERT, fragmentShader: PAD_FRAG, side: THREE.DoubleSide, alphaToCoverage: true }), 1);
+  meshOf(over, padShape, new THREE.ShaderMaterial({ uniforms: { ...light, ...look, ...field, ...overhead }, vertexShader: PAD_VERT, fragmentShader: PAD_FRAG, side: THREE.DoubleSide, alphaToCoverage: true }), 1);
   const maskScene = new THREE.Scene();
   meshOf(maskScene, padShape, new THREE.ShaderMaterial({ uniforms: { ...field }, vertexShader: PAD_VERT, fragmentShader: PAD_MASK_FRAG, side: THREE.DoubleSide, depthTest: false, depthWrite: false }));
   const maskCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
@@ -146,6 +173,10 @@ export function createRenderer(canvas, pond) {
     uniforms: { uPrev: { value: null }, uPadMask: { value: padMask.texture }, uTexel: { value: rippleTexel }, uFieldHalf: { value: fieldHalf }, uImpulse: { value: impulses }, uCount: { value: 0 }, uWave: { value: 0.24 } },
     vertexShader: QUAD_VERT, fragmentShader: RIPPLE_FRAG, depthTest: false, depthWrite: false,
   }));
+  const sunScene = new THREE.Scene();
+  meshOf(sunScene, quad, new THREE.ShaderMaterial({ uniforms: light, vertexShader: QUAD_VERT, fragmentShader: SUN_FRAG, depthTest: false, depthWrite: false }));
+  const overheadScene = new THREE.Scene();
+  meshOf(overheadScene, quad, new THREE.ShaderMaterial({ uniforms: { ...light, ...overhead }, vertexShader: QUAD_VERT, fragmentShader: OVERHEAD_FRAG, depthTest: false, depthWrite: false }));
   function clearRipples() {
     const was = renderer.getRenderTarget();
     for (const target of ripples) { renderer.setRenderTarget(target); renderer.setClearColor(0x000000, 1); renderer.clear(); }
@@ -253,10 +284,24 @@ export function createRenderer(canvas, pond) {
     renderer.setClearColor(0x000000, 1);
     renderer.clear();
     renderer.render(maskScene, maskCamera);
+    if (!laid) {
+      laid = true;
+      for (const [i, target] of [bed, bedStones].entries()) {
+        bedMesh.material = bakes[i];
+        renderer.setRenderTarget(target);
+        renderer.render(bedScene, camera);
+      }
+      renderer.setRenderTarget(overheadTarget);
+      renderer.render(overheadScene, screenCamera);
+      renderer.setRenderTarget(sunTarget);
+      renderer.render(sunScene, screenCamera);
+    }
     renderer.setRenderTarget(underTarget);
     renderer.setClearColor(0x000000, 1);
     renderer.clear();
     renderer.render(under, camera);
+    renderer.setRenderTarget(chopTarget);
+    renderer.render(chopScene, screenCamera);
     renderer.setRenderTarget(null);
     renderer.clear();
     renderer.render(over, camera);
@@ -269,6 +314,9 @@ export function createRenderer(canvas, pond) {
     renderer.setSize(w, h, false);
     look.uRes.value.set(w, h);
     underTarget.setSize(w, h);
+    chopTarget.setSize(Math.ceil(w / 2), Math.ceil(h / 2));
+    bed.setSize(w, h); bedStones.setSize(w, h);
+    laid = false;
     const aspect = cssWidth / cssHeight, { halfW, halfH } = homeBounds(aspect);
     camera.aspect = aspect;
     camera.position.set(0, halfH / Math.tan(THREE.MathUtils.degToRad(VIEW.fov / 2)), 0);
@@ -286,6 +334,11 @@ export function createRenderer(canvas, pond) {
       // Rings spread at the same speed in metres whatever the frame, as fast as the grid allows.
       const cell = (2 * fieldHalf.x) / FIELD_WIDTH;
       rippleStep.material.uniforms.uWave.value = Math.min(0.45, (RIPPLE_SPEED * FIXED_STEP / cell) ** 2);
+      const reach = overhead.uOverheadHalf.value.set(halfW + OVERHEAD_MARGIN, halfH + OVERHEAD_MARGIN);
+      overheadTarget.setSize(Math.ceil(reach.x * 2 * OVERHEAD_TEXELS), Math.ceil(reach.y * 2 * OVERHEAD_TEXELS));
+      // The bottom shows a quarter more than the surface, and its light comes in from further along.
+      const sunReach = light.uSunHalf.value.set(halfW * 1.25 + 0.5, halfH * 1.25 + 0.5);
+      sunTarget.setSize(Math.ceil(sunReach.x * 2 * SUN_TEXELS), Math.ceil(sunReach.y * 2 * SUN_TEXELS));
       maskCamera.left = -fieldHalf.x; maskCamera.right = fieldHalf.x; maskCamera.top = fieldHalf.y; maskCamera.bottom = -fieldHalf.y;
       maskCamera.position.set(0, 5, 0);
       maskCamera.lookAt(0, 0, 0);
@@ -303,12 +356,13 @@ export function createRenderer(canvas, pond) {
 
   function dispose() {
     const geometries = new Set(), materials = new Set();
-    for (const root of [under, over, maskScene, rippleScene]) {
+    for (const root of [under, over, maskScene, rippleScene, bedScene, overheadScene, sunScene, chopScene]) {
       root.traverse((o) => { if (o.geometry) geometries.add(o.geometry); if (o.material) materials.add(o.material); });
     }
     geometries.forEach((g) => g.dispose());
     materials.forEach((m) => m.dispose());
-    for (const target of [underTarget, padMask, ...ripples]) target.dispose();
+    bakes.forEach((m) => m.dispose());
+    for (const target of [underTarget, chopTarget, bed, bedStones, overheadTarget, sunTarget, padMask, ...ripples]) target.dispose();
     renderer.dispose();
   }
 

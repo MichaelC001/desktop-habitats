@@ -200,9 +200,20 @@ Surface surface() {
 }
 `;
 
+// Everything about the wood but its glow stays put while the camera does, so it is worked out
+// once per pixel and cached (see render.js). The key tells one log, and its end caps, from another.
+export const WOOD_PARS = /* glsl */`
+struct Wood { vec3 normal; float height; float crack; float id; float burn; float ash; };
+float woodKey() { return vSurf.w + 128.0 * step(0.25, fract(vSurf.z)); }
+// Unit normals packed into two numbers (octahedral mapping).
+vec2 octWrap(vec2 v) { return (1.0 - abs(v.yx)) * vec2(v.x >= 0.0 ? 1.0 : -1.0, v.y >= 0.0 ? 1.0 : -1.0); }
+vec2 octEncode(vec3 n) { n /= abs(n.x) + abs(n.y) + abs(n.z); return n.z >= 0.0 ? n.xy : octWrap(n.xy); }
+vec3 octDecode(vec2 f) { vec3 n = vec3(f, 1.0 - abs(f.x) - abs(f.y)); if (n.z < 0.0) n.xy = octWrap(n.xy); return normalize(n); }
+`;
+
 // Charred wood: alligator-cracked charcoal with glowing seams, grey ash on top, weathered
 // wood toward the cold ends.
-export const LOGS = /* glsl */`
+export const WOOD = /* glsl */`
 // Charred wood splits along the grain into long fissures, and each strip between them
 // checks across into blocks. along is metres down the log, around is the angle.
 float charHeight(float along, float around, float radius, float seed, out float crack, out float cellId) {
@@ -240,8 +251,8 @@ float barkHeight(float along, float around, float radius, float seed) {
   float split = abs(snoise(vec3(ring * 150.0, along * 12.0 + seed + 3.0)));
   return 1.0 - furrow * 0.75 - split * 0.35;
 }
-Surface surface() {
-  Surface s;
+Wood wood() {
+  Wood w;
   float along = vSurf.x, around = vSurf.y * 6.2831853, cap = step(0.25, fract(vSurf.z));
   float seed = vSurf.w * 7.31, radius = vAxis.w;
   vec3 T = vAxis.xyz, N = normalize(vWorldNormal);
@@ -258,7 +269,53 @@ Surface surface() {
   crack *= smoothstep(0.15, 0.6, burn);
   if (cap > 0.5) { crack = smoothstep(0.6, 0.9, abs(snoise(vWorld * 90.0))); h0 = 0.5; ha = hb = h0; id = 0.5; }
   float k = mix(0.0011, 0.0008, burn);
-  vec3 n = normalize(N - (T * (ha - h0) + B * (hb - h0)) / e * k);
+  w.normal = normalize(N - (T * (ha - h0) + B * (hb - h0)) / e * k);
+  // Grey-white ash where the char has burned through, mostly on top.
+  float up = smoothstep(0.2, 0.85, N.y);
+  w.ash = smoothstep(0.35, 0.75, fbm3(vWorld * 18.0 + seed) * 0.8 + up * 0.35 - 0.15) * smoothstep(0.5, 0.9, burn) * (1.0 - crack);
+  w.height = h0; w.crack = crack; w.id = id; w.burn = burn;
+  return w;
+}
+`;
+
+// Drawn once into the wood cache: the logs' fixed detail, front-most log per pixel.
+export const WOOD_BAKE_VERT = /* glsl */`
+${SURFACE_VERT_PARS}
+void main() {
+  vec3 transformed = position, objectNormal = normal;
+  ${SURFACE_VERT}
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}
+`;
+export const WOOD_BAKE_FRAG = /* glsl */`
+layout(location = 1) out highp vec4 gWood;
+void main() {
+  Wood w = wood();
+  gl_FragColor = vec4(octEncode(w.normal), w.height, w.crack);
+  gWood = vec4(w.id, w.burn, w.ash, woodKey() / 255.0);
+}
+`;
+
+export const LOGS = /* glsl */`
+uniform sampler2D uWood[2];
+// The cached wood at this pixel, or, on the edge of a log, at the neighbour this same log
+// covered when the cache was drawn. Working the wood out here instead, even rarely, would
+// make the whole shader slower. A sliver too thin to cover any pixel's centre is plain bark.
+Wood cachedWood() {
+  ivec2 pixel = ivec2(gl_FragCoord.xy);
+  const ivec2 around[5] = ivec2[5](ivec2(0), ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+  for (int i = 0; i < 5; i++) {
+    vec4 b = texelFetch(uWood[1], pixel + around[i], 0);
+    if (abs(b.w * 255.0 - woodKey()) > 0.5) continue;
+    vec4 a = texelFetch(uWood[0], pixel + around[i], 0);
+    return Wood(octDecode(a.xy), a.z, a.w, b.x, b.y, b.z);
+  }
+  return Wood(normalize(vWorldNormal), 0.5, 0.0, 0.5, 0.0, 0.0);
+}
+Surface surface() {
+  Surface s;
+  Wood w = cachedWood();
+  float seed = vSurf.w * 7.31, burn = w.burn, crack = w.crack, id = w.id, h0 = w.height, ashMask = w.ash;
   // Colour: grey-brown bark, scorched to dark brown, then matte charcoal with a faint sheen.
   float tone = fract(seed * 0.4137);
   vec3 bark = mix(vec3(0.03, 0.025, 0.02), vec3(0.075, 0.065, 0.055), smoothstep(0.2, 0.9, h0)) * (0.8 + 0.4 * tone);
@@ -267,15 +324,12 @@ Surface surface() {
   vec3 albedo = mix(bark, scorched, smoothstep(0.0, 0.4, burn));
   albedo = mix(albedo, charcoal, smoothstep(0.35, 0.8, burn));
   albedo = mix(albedo, vec3(0.004), crack);
-  // Grey-white ash where the char has burned through, mostly on top.
-  float up = smoothstep(0.2, 0.85, N.y);
-  float ashMask = smoothstep(0.35, 0.75, fbm3(vWorld * 18.0 + seed) * 0.8 + up * 0.35 - 0.15) * smoothstep(0.5, 0.9, burn) * (1.0 - crack);
   albedo = mix(albedo, mix(vec3(0.13, 0.125, 0.12), vec3(0.26, 0.25, 0.24), id), ashMask * 0.7);
   s.albedo = albedo;
   s.rough = mix(0.9, mix(0.72, 1.0, crack), burn);
   s.rough = mix(s.rough, 1.0, ashMask);
   s.metal = 0.0;
-  s.normal = n;
+  s.normal = w.normal;
   // Glow in the fissures where the log sits in the fire, and whole faces at the burned end.
   // Where the flames wrap the wood it glows: the fissures first, then, at the hottest tips,
   // the whole surface red-hot under a skin of ash, pulsing with the fire.
@@ -459,16 +513,24 @@ float flame(vec3 p, out float temp) {
   q.xz -= hs * 0.1 * vec2(sin(hs * 4.1 - t * 2.3) * 0.6 + sin(hs * 7.3 - t * 3.7 + 1.3) * 0.4, sin(hs * 3.7 - t * 2.1 + 2.0) * 0.6 + sin(hs * 6.9 - t * 3.3 + 4.1) * 0.4);
   float erosion = mix(0.6, 1.3, smoothstep(0.0, 0.5, hs));
   float shape = outline(q, hs);
-  // Empty air: turbulence cannot reach this far, so skip the expensive part.
-  // The turbulence below sums to at most about 1.07 in magnitude, scaled by 1.15 erosion.
-  float reachable = erosion * 1.15 * 1.1 + 0.2;
+  // Empty air: turbulence cannot reach this far, so skip the expensive part. Each noise
+  // term is at most 1 in magnitude, so the billows below lift the field by at most 0.95
+  // times the erosion, and the fine detail by at most lift.
+  float lift = 1.5 * 0.07 * (0.4 + hs);
+  float reachable = 0.95 * erosion * 1.15 + lift;
   if (shape + reachable < 0.0) return shape + reachable;
   // Gas rises and accelerates, so features stretch as they climb and the top breaks into tongues.
   vec3 w = vec3(q.x * 7.5, hs * 2.6 - t * 3.6, q.z * 7.5);
   vec3 warp = vec3(snoise(w * 0.55 + vec3(3.1, -t * 0.5, 0.0)), 0.0, snoise(w * 0.55 + vec3(9.7, -t * 0.5, 2.0)));
   vec3 v = w + warp * 0.9;
   // Broad billows, then ridged sheets that pull the flame into separate licking tongues.
-  float n = 0.55 * snoise(v) + 0.3 * (0.6 - 1.4 * abs(snoise(v * 2.1 + 5.0))) + 0.15 * snoise(v * 4.3 + 1.0) + 0.07 * snoise(v * 8.7 + 2.0);
+  // The same bound, tightened after each stage, skips the finer octaves outside the flame.
+  float n = 0.55 * snoise(v);
+  float bound = shape + (n + 0.4) * erosion * 1.15 + lift;
+  if (bound < 0.0) return bound;
+  n += 0.3 * (0.6 - 1.4 * abs(snoise(v * 2.1 + 5.0))) + 0.15 * snoise(v * 4.3 + 1.0) + 0.07 * snoise(v * 8.7 + 2.0);
+  bound = shape + n * erosion * 1.15 + lift;
+  if (bound < 0.0) return bound;
   float fine = snoise(vec3(q.x * 20.0, hs * 8.0 - t * 7.0, q.z * 20.0)) + 0.5 * snoise(vec3(q.x * 42.0, hs * 16.0 - t * 10.0, q.z * 42.0));
   float f = shape + n * erosion * 1.15 + fine * 0.07 * (0.4 + hs);
   // Hottest low and deep inside; streaks of hotter gas run through it; tips cool to red.
@@ -503,8 +565,9 @@ void main() {
   enter = max(enter, 0.0);
   leave = min(leave, viewDistance(vUv, dirView));
   if (leave <= enter) { gl_FragColor = vec4(0.0); return; }
+  // A span cut short by the logs or the flame's edge would get ever finer steps; 8 mm is fine enough.
   const int STEPS = 110;
-  float dt = (leave - enter) / float(STEPS);
+  float dt = max((leave - enter) / float(STEPS), 0.008);
   float jitter = hash13(vec3(gl_FragCoord.xy, uFrame * 7.0 + 1.0));
   float t = enter + dt * jitter;
   vec3 light = vec3(0.0);
