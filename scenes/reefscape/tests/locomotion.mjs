@@ -50,7 +50,8 @@ for(const seed of [36719,42,9001]){
     assert.ok(s.idleTail/(s.active||1)<.10,'Strong tail motion must not mainly occur in place');
     assert.ok(s.aligned/(s.moving||1)>.94,'Swimming must follow the body heading through water');
   }
-  assert.ok(maxHost<2.6,'Clownfish retain their host territory');
+  // Goals stay over the crown and within a body length or so above it (chooseGoal).
+  assert.ok(maxHost<HOST.radius+1,`Clownfish retain their host territory: ${maxHost.toFixed(2)} from the host, seed ${seed}`);
   reports.push({seed,minRoamingWidth:Math.min(...free.map(s=>s.max.x-s.min.x)),minRoamingDistance:Math.min(...free.map(s=>s.path)),maxStep,maxHost});
 }
 // A frightened chromis may enter its own shelter. Returning the avoidance envelope

@@ -44,7 +44,7 @@ for(let i=0;i<60*180;i++){
     }
   }
 }
-assert.ok(maxHome<2.6,`Clownfish host radius ${maxHome}`);
+assert.ok(maxHome<HOST.radius+1,`Clownfish host radius ${maxHome}`);
 // Reef-wide coverage now lives in locomotion.mjs. The old requirement that chromis
 // remain over one coral >72% of the time contradicted free roaming.
 // A fish swims where it points. Its velocity through the water must lie along its heading

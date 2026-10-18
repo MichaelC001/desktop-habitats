@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { register } from 'node:module';
 register('../../riverscape/tests/three-loader.mjs',import.meta.url);
 const { ANEMONES,HOST }=await import('../src/layout.js');
-const { buildCrown,crownOrder,crownBudget }=await import('../src/anemone-crown.js');
+const { buildCrown,crownOrder,crownBudget,HOST_DENSITY,HOST_COLUMN }=await import('../src/anemone-crown.js');
 const { createAnemone,TENTACLE_COUNT }=await import('../src/anemone.js');
 const THREE=await import('three');
 let total=0;const summary=[];
@@ -34,7 +34,7 @@ for(let i=0;i<ANEMONES.length;i++){
   summary.push({radius:ANEMONES[i].radius,count,compact,meanLength:roots.reduce((n,r)=>n+r.length,0)/count});
 }
 assert.equal(total,TENTACLE_COUNT);
-const host=buildCrown(HOST);assert.equal(host.compact,false);assert.equal(host.rim,.36);assert.equal(host.height,.66);assert.equal(host.count,Math.round(110*(HOST.radius/.9)**1.3));
+const host=buildCrown(HOST);assert.equal(host.compact,false);assert.equal(host.rim,.36);assert.equal(host.height,HOST_COLUMN);assert.ok(HOST_COLUMN<.4,'The host column stays short, anchored in the rock');assert.equal(host.count,Math.round(HOST_DENSITY*(HOST.radius/.9)**1.3));assert.ok(host.count>=300&&host.count<=600,'The host carries a dense bubble-tip crown');
 const scene=new THREE.Scene(),anemone=createAnemone(scene);
 for(const quality of ['detail','eco','balanced','detail']){
   anemone.setQuality(quality);

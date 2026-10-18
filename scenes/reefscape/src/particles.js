@@ -1,49 +1,54 @@
 import * as THREE from 'three';
 import { randomGenerator } from './math.js';
-import { currentAt, extinctionGLSL, shadowGLSL, inscatterGLSL, waterTime } from './water.js';
+import { currentAt, extinctionGLSL, shadowGLSL, inscatterGLSL, waterTime, causticMap } from './water.js';
 
 /** Suspended matter. Real tank water is never optically empty: there is always detritus
  *  and marine snow drifting in the circulation, and it is most of what tells the eye the
- *  water has a front and a back. A mote is sized and faded by its own distance, so the
- *  near ones read as soft close-up specks and the far ones as fine haze. A mote is lit by
- *  the same light the water around it scatters, so it brightens in a shaft and toward the
- *  surface and goes dark in the rock's shadow: dust in a beam, not stars on a backdrop. */
-// A mote is far denser than the water around it, so it sends back many times the light
-// the same volume of clear water scatters.
-const MOTE_GAIN=70;
+ *  water has a front and a back. It is sparse in a clean reef tank, so a light dusting:
+ *  flecks that occlude a little and catch the lamp, not points of light. A fleck is sized
+ *  by its own distance, so the near ones read as soft out-of-focus discs and the far ones
+ *  as fine haze, and it is lit by the same light the water around it scatters, so it
+ *  brightens in a shaft and toward the surface and goes dark in the rock's shadow. */
+// The share of the light reaching a fleck that it sends back toward the eye: dun detritus
+// has a low albedo, and a fleck seen edge-on shows little of it.
+const MOTE_GAIN=.8;
 export function createParticles(scene,simulation,shadow){
-  const rng=randomGenerator(846),N=4500,pos=new Float32Array(N*3),vel=new THREE.Vector3(),point=new THREE.Vector3();
-  // grain.x scales the mote, grain.y its brightness, grain.z how fast it sinks. A few
-  // large slow flecks among many fine ones, rather than one uniform dust.
+  const rng=randomGenerator(846),N=2200,pos=new Float32Array(N*3),vel=new THREE.Vector3(),point=new THREE.Vector3();
+  // grain.x scales the fleck, grain.y its brightness, grain.z a phase for its own small
+  // tumble in the eddies. A few large slow flecks among many fine ones.
   const grain=new Float32Array(N*3),sink=new Float32Array(N);
   for(let i=0;i<N;i++){
     pos.set([(rng()-.5)*21,rng()*8,-4+rng()*10],i*3);
-    const big=rng()<.05,size=big?1.6+rng()*1.4:.45+rng()*.6;
-    grain.set([size,big?.3+rng()*.3:.9+rng()*.9,0],i*3);
+    const big=rng()<.06,size=big?1.4+rng()*1.2:.45+rng()*.55;
+    grain.set([size,big?.45+rng()*.3:.7+rng()*.6,rng()*6.283],i*3);
     sink[i]=(big?.016:.006)+rng()*.008;
   }
   const g=new THREE.BufferGeometry();
   g.setAttribute('position',new THREE.BufferAttribute(pos,3).setUsage(THREE.DynamicDrawUsage));
   g.setAttribute('grain',new THREE.BufferAttribute(grain,3));
-  const mat=new THREE.ShaderMaterial({transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,uniforms:{pixelRatio:{value:1},reefTime:waterTime,...shadow},
-    vertexShader:`uniform float pixelRatio;uniform float reefTime;attribute vec3 grain;varying vec3 glow;varying float disc;
+  const mat=new THREE.ShaderMaterial({transparent:true,depthWrite:false,uniforms:{pixelRatio:{value:1},reefTime:waterTime,reefCaustics:causticMap,...shadow},
+    vertexShader:`uniform float pixelRatio;uniform float reefTime;attribute vec3 grain;varying vec3 glow;varying float disc,opacity;
       #include <packing>
       ${extinctionGLSL}${shadowGLSL}${inscatterGLSL}
       void main(){
-        vec4 mv=modelViewMatrix*vec4(position,1.);gl_Position=projectionMatrix*mv;
-        // A speck close to the lens is a soft disc the size of the lens's blur circle, not
-        // a sharper point; the fragment spreads the big ones so their light stays the same.
-        disc=clamp(26.*grain.x/(-mv.z),2.,18.);gl_PointSize=disc*pixelRatio;
-        // A light dusting, not snow: the motes give the water a front and a back and catch
-        // the shafts, they are not there to be looked at.
-        // A mote is large beside a wavelength, so it scatters the lamp's light without the
-        // water's own blue cast: brightness from the water around it, colour from the lamp,
-        // blue only from the water between it and the glass.
-        vec3 light=reefInscatter(position,reefTime,reefLit(position));
-        glow=grain.y*${MOTE_GAIN.toFixed(1)}*dot(light,vec3(.3,.4,.3))*vec3(.62,.84,1.)*reefTransmittance(reefWaterPath(position,cameraPosition));
+        // Eddies too small for the circulation field: each fleck wanders a few millimetres.
+        vec3 p=position+.035*vec3(sin(reefTime*.41+grain.z),sin(reefTime*.33+grain.z*1.7),cos(reefTime*.37+grain.z*2.3));
+        vec4 mv=modelViewMatrix*vec4(p,1.);gl_Position=projectionMatrix*mv;
+        // A fleck close to the lens is a soft disc the size of the lens's blur circle, not a
+        // sharper point; its opacity spreads with it so it never reads as a bright blob.
+        disc=clamp(22.*grain.x/(-mv.z),1.5,16.);gl_PointSize=disc*pixelRatio;
+        opacity=min(1.,4./disc)*.85;
+        // A fleck is large beside a wavelength, so it scatters the lamp's light without the
+        // water's own blue cast: brightness from the water around it, colour from its own
+        // dun detritus, blue only from the water between it and the glass.
+        vec3 light=reefAmbientLight(p)+reefBeamLight(p,reefTime,reefLit(p));
+        vec3 path=reefTransmittance(reefWaterPath(p,cameraPosition));
+        glow=grain.y*${MOTE_GAIN.toFixed(1)}*dot(light,vec3(.3,.4,.3))*vec3(.92,.90,.82)*path;
+        // Far flecks dissolve into the water rather than stay as specks on top of it.
+        opacity*=dot(path,vec3(.2,.4,.4));
       }`,
-    fragmentShader:`varying vec3 glow;varying float disc;
-      void main(){vec2 c=gl_PointCoord-.5;float a=exp(-dot(c,c)*10.)*min(1.,5./disc);gl_FragColor=vec4(glow*a,1.);}`});
+    fragmentShader:`varying vec3 glow;varying float disc,opacity;
+      void main(){vec2 c=gl_PointCoord-.5;float a=exp(-dot(c,c)*12.)*opacity;if(a<.004)discard;gl_FragColor=vec4(glow,a);}`});
   const points=new THREE.Points(g,mat);points.frustumCulled=false;scene.add(points);
   const foodGeo=new THREE.SphereGeometry(1,7,5),foodMat=new THREE.MeshStandardMaterial({color:'#b49366',roughness:.9});
   const pellets=new THREE.InstancedMesh(foodGeo,foodMat,simulation.food.length);pellets.frustumCulled=false;scene.add(pellets);const dummy=new THREE.Object3D();
