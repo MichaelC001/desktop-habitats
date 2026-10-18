@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { merge, ellipsoid, tint } from './geometry.js';
 import { randomGenerator, groundHeight } from './math.js';
-import { underwater, extinctionGLSL, inscatterGLSL, surfaceGLSL, ABSORB, SURFACE, waterTime } from './water.js';
+import { underwater, extinctionGLSL, causticGLSL, inscatterGLSL, surfaceGLSL, EXTINCTION, BEYOND, SURFACE, waterTime, causticMap } from './water.js';
 import { ROCKS, HOST, STATIONS, TANK } from './layout.js';
 export {ROCKS,HOST,STATIONS};
 let surfaceField=null,surfaceW=0,surfaceH=0;
@@ -27,14 +27,18 @@ export async function createTerrain(scene){
   const [rockGeo,sandMap,crustMap,reliefMap]=await Promise.all([liveRockGeometry(),
     ...['aragonite.png','live-rock-surface.png','live-rock-normal.png'].map(name=>loader.loadAsync(new URL('../assets/'+name,import.meta.url).href))]);
   for(const t of [sandMap,crustMap,reliefMap]){t.wrapS=t.wrapT=THREE.RepeatWrapping;t.anisotropy=8;}
-  // Aragonite is a bright bed under a reef lamp — near white, faintly warm — bright enough
-  // to throw a real bounce back into the rock. The baked atlas carries the millimetre grain
-  // and the odd shell flake; slow drifts break up the sheet at the wide view; and a warped
-  // ripple field lays the soft marks the pumps leave, which the bed mesh is far too coarse
-  // to carry. Troughs hold a little fine detritus, so they read a shade darker.
+  // Aragonite under a reef lamp is a warm off-white, not paper: cream grains among greyer
+  // and pinkish ones, a few dark mineral grains, and flat shell fragments that catch the
+  // light. Grain size wanders over the bed, coarse rubble-sand in drifts and fine sugar
+  // between, and slow drifts break up the sheet at the wide view. A warped ripple field
+  // lays the soft marks the pumps leave, which the bed mesh is far too coarse to carry.
+  // Troughs hold a little fine detritus, so they read a shade darker.
   const sandMat=underwater(new THREE.MeshStandardMaterial({roughness:.92,map:sandMap}),{key:'tank-sand',
     vertex:'attribute float shade;varying float vShade;varying vec3 vBedNormal;',begin:'vShade=shade;',normal:'vBedNormal=normal;',fragment:'varying float vShade;varying vec3 vBedNormal;',
-    map:`vec2 bed=vReefWorld.xz;vec3 reefGrain=mix(texture2D(map,bed*.5).rgb,texture2D(map,bed*.21+.43).rgb,.55);
+    map:`vec2 bed=vReefWorld.xz;
+      float coarse=smoothstep(-.35,.55,sin(bed.x*.37+1.3*sin(bed.y*.52))*sin(bed.y*.61-bed.x*.18+.7));
+      vec3 fineGrain=mix(texture2D(map,bed*.5).rgb,texture2D(map,bed*.21+.43).rgb,.55),coarseGrain=texture2D(map,bed*.27+.17).rgb;
+      vec3 reefGrain=mix(fineGrain,coarseGrain,coarse*.8);
       float drift=sin(bed.x*.71+2.*sin(bed.y*.93))*sin(bed.y*.83+bed.x*.37)+.5*sin(bed.x*2.3-bed.y*1.7+sin(bed.y*2.9));
       // Two crossed wave sets, each bent by a slow warp, give the low hummocks of a bed
       // the pumps keep stirring rather than a ruled field of dune ripples.
@@ -43,9 +47,18 @@ export async function createTerrain(scene){
       vec2 dPhase=vec2(.34,.94)*10.5+1.1*cos(warpA)*vec2(.83,1.7*.61*cos(bed.y*.61))+.6*cos(warpB)*vec2(-.29,1.37),dCross=vec2(.91,-.41)*7.3+.9*cos(warpB)*vec2(-.29,1.37);
       float ripple=sin(phase)+.25*sin(2.*phase+.8)+.6*sin(cross);
       vec2 rippleSlope=.10*vShade*((cos(phase)+.5*cos(2.*phase+.8))*dPhase+.6*cos(cross)*dCross);`,
-    color:`diffuseColor.rgb=mix(vec3(.42,.33,.23),vec3(.92,.875,.78),smoothstep(.42,.92,reefGrain.r))*(.90+.08*drift)*(.90+.055*ripple)*vShade;`,
+    color:`vec3 sand=mix(vec3(.36,.30,.22),vec3(.88,.80,.66),smoothstep(.40,.90,reefGrain.r));
+      // Shell fragments are the brightest flat grains; each takes its own cream or blush.
+      float shell=smoothstep(.86,.95,reefGrain.r),tone=fract(sin(dot(floor(bed*41.),vec2(12.99,78.23)))*43758.5);
+      sand=mix(sand,mix(vec3(.80,.74,.66),vec3(.78,.62,.58),step(.7,tone)),shell*.85);
+      sand*=mix(1.,.86+.2*tone,.5*(1.-shell));
+      // The back pane's foot gathers detritus and shade, so the bed darkens into it.
+      diffuseColor.rgb=sand*(.90+.08*drift)*(.90+.055*ripple)*(.95-.07*coarse)*vShade*mix(.2,1.,smoothstep(${TANK.back.toFixed(2)},${(TANK.back+2.6).toFixed(2)},vReefWorld.z));`,
     surfaceNormal:`vec2 grainSlope=reefGrain.gb*2.-1.;
-      normal=normalize(mat3(viewMatrix)*normalize(normalize(vBedNormal)+vec3(grainSlope.x*.7-rippleSlope.x,0.,grainSlope.y*.7-rippleSlope.y)));`});
+      normal=normalize(mat3(viewMatrix)*normalize(normalize(vBedNormal)+vec3(grainSlope.x*.7-rippleSlope.x,0.,grainSlope.y*.7-rippleSlope.y)));`,
+    // The bed runs on under the rear glass, so its last few hand-widths sink into the water
+    // the back wall paints instead of ending at a lit edge.
+    recede:`smoothstep(${(TANK.back+3.4).toFixed(2)},${(TANK.back+.15).toFixed(2)},vReefWorld.z)`});
   // The bed runs past every frame edge, like Riverbed's, so no rim or wall is ever seen.
   const ground=new THREE.PlaneGeometry(30,14,180,84);ground.rotateX(-Math.PI/2);ground.translate(0,0,1.0);const p=ground.attributes.position,shade=new Float32Array(p.count);
   // Sand darkens where it meets the rock: a baked contact shadow from each rock footprint,
@@ -55,25 +68,56 @@ export async function createTerrain(scene){
     shade[i]=1-.62*contact;}
   ground.setAttribute('shade',new THREE.BufferAttribute(shade,1));ground.computeVertexNormals();const sand=new THREE.Mesh(ground,sandMat);sand.receiveShadow=true;scene.add(sand);
   // Live rock is composed per pixel from the surface atlas, laid tri-planar over the baked
-  // limestone: a dark brown-olive base of turf and detritus, coralline crust over the
-  // raised parts in violet to rose, small bright encrusting polyps, and every pit dark.
-  // The vertex stream brings sky visibility and how thick and which hue the crust runs.
+  // limestone. Most of a piece of aquacultured rock is bare skeleton weathered to a warm grey-tan;
+  // coralline crust takes the raised, lit parts in patches of chalky pink and lilac; a
+  // short olive-brown turf and film fill the hollows it leaves; small bright encrusting
+  // starts are scattered over all of it; and the pits stay dark. The vertex stream brings
+  // sky visibility and how thick and which hue the crust runs over each stretch.
   const rockMat=underwater(new THREE.MeshStandardMaterial({roughness:1,map:crustMap}),{key:'live-rock',
     vertex:'attribute vec3 surface;varying vec3 vRockNormal,vSurface;',begin:'vSurface=surface;',normal:'vRockNormal=normal;',
     fragment:'varying vec3 vRockNormal,vSurface;uniform sampler2D reefRelief;',map:`
     vec3 w=pow(abs(normalize(vRockNormal)),vec3(4.));w/=max(.001,w.x+w.y+w.z);
-    vec3 q=vReefWorld*.62,f=vReefWorld*2.3+.37;
+    vec3 q=vReefWorld*.62,f=vReefWorld*2.3+.37,o=vReefWorld*.13+.71;
     vec3 crust=texture2D(map,q.yz).rgb*w.x+texture2D(map,q.xz).rgb*w.y+texture2D(map,q.xy).rgb*w.z;
     vec3 fine=texture2D(map,f.yz).rgb*w.x+texture2D(map,f.xz).rgb*w.y+texture2D(map,f.xy).rgb*w.z;
+    // A very low octave of the same atlas: which way a whole face of rock has gone, so a
+    // boulder is not one even mix of everything.
+    vec3 broad=texture2D(map,o.yz).rgb*w.x+texture2D(map,o.xz).rgb*w.y+texture2D(map,o.xy).rgb*w.z;
     vec3 rx=texture2D(reefRelief,q.yz).xyz,ry=texture2D(reefRelief,q.xz).xyz,rz=texture2D(reefRelief,q.xy).xyz;
     float relief=min(crust.r,fine.r*.9+.12),speck=rx.z*w.x+ry.z*w.y+rz.z*w.z;
-    float cover=smoothstep(.47,.66,fine.g*.65+crust.g*.35+(vSurface.g-.5)*.5),hue=clamp(vSurface.b+(crust.b-.45)*.9+(fine.b-.5)*.5,0.,1.);
-    vec3 coralline=mix(mix(vec3(.17,.025,.19),vec3(.36,.035,.16),smoothstep(.05,.55,hue)),vec3(.42,.08,.10),smoothstep(.6,1.,hue));
-    coralline=mix(coralline,vec3(.42,.17,.27),fine.g*fine.r*.4);
-    vec3 turf=mix(mix(vec3(.090,.052,.026),vec3(.085,.074,.018),crust.b),vec3(.050,.030,.022),fine.b*(1.-crust.b));
-    vec3 rock=mix(turf,coralline,cover);
-    rock=mix(rock,mix(vec3(.30,.34,.07),vec3(.40,.22,.30),step(.55,fine.b)),speck*.85);
-    diffuseColor.rgb=rock*mix(.05,1.,smoothstep(.36,.68,relief))*(.18+.82*vSurface.r*vSurface.r*vSurface.r);`,
+    float up=normalize(vRockNormal).y;
+    // Aquacultured limestone is laid down in beds, so a face shows faint layering under
+    // the pitting.
+    float bedding=.5+.5*sin(vReefWorld.y*7.3+fine.r*2.6+broad.r*5.);
+    vec3 stone=mix(vec3(.10,.064,.038),vec3(.180,.122,.072),smoothstep(.25,.85,fine.r*.6+crust.r*.4))*(.88+.18*broad.r)*(.92+.10*bedding);
+    // A grain finer than the atlas's own, for the crust's speckled, eroded margins.
+    vec3 g=vReefWorld*7.9+.13;
+    float grain=texture2D(map,g.yz).g*w.x+texture2D(map,g.xz).g*w.y+texture2D(map,g.xy).g*w.z;
+    // Coralline grows on the raised crust of upward faces open to the lamp; how thick it
+    // runs drifts over each boulder, and its edge breaks into flecks instead of a clean
+    // outline. Bare stone and film still hold most of the rock.
+    float crustSite=broad.g*.45+crust.g*.30+(vSurface.g-.5)*.6+.22*up+(relief-.5)*.35+(fine.g-.5)*.22+(grain-.5)*.30;
+    float cover=smoothstep(.73,.87,crustSite)*(.55+.45*smoothstep(.3,.7,broad.g))*smoothstep(-.2,.5,up)*smoothstep(.35,.75,vSurface.r);
+    float hue=clamp(vSurface.b+(crust.b-.45)*.7+(fine.b-.5)*.4,0.,1.);
+    // Each crust patch its own colour: maroon, rose, a little purple, and pale pink where
+    // a patch has bleached thin.
+    vec3 coralline=mix(mix(vec3(.26,.06,.09),vec3(.48,.20,.24),smoothstep(.10,.50,hue)),vec3(.30,.12,.28),smoothstep(.68,.95,hue));
+    coralline=mix(coralline,vec3(.52,.37,.39),.75*smoothstep(.58,.70,broad.r));
+    coralline*=.62+.55*fine.r*grain;
+    coralline=mix(coralline,vec3(.52,.38,.43),smoothstep(.6,1.,cover*(1.-cover)*4.)*grain*.5);
+    // Film and short turf in the hollows and on faces the lamp misses.
+    float turf=smoothstep(.40,.62,broad.b*.40+crust.b*.30+(.6-relief)*.35+(.6-vSurface.r)*.3+(fine.b-.5)*.25-.10*up)*(1.-cover);
+    vec3 film=mix(mix(vec3(.08,.09,.035),vec3(.12,.085,.045),fine.b),vec3(.05,.055,.025),crust.b*(1.-fine.r));
+    // A thin film of diatoms and green algae over the open stone, brown in some stretches
+    // and green in others.
+    float algae=smoothstep(.42,.64,broad.r*.45+fine.g*.35+crust.b*.20+(grain-.5)*.2)*smoothstep(-.2,.5,up)*(1.-turf);
+    vec3 algaeTint=mix(vec3(.15,.10,.045),vec3(.09,.115,.04),smoothstep(.45,.75,broad.b));
+    vec3 rock=mix(mix(mix(stone,algaeTint,algae*.7),film,turf*.8),coralline,cover);
+    rock=mix(rock,mix(vec3(.46,.50,.22),vec3(.64,.36,.40),step(.55,fine.b)),speck*.3);
+    // Porous limestone: every pit, hole and undercut falls to a dark purple-brown, the
+    // atlas's relief at two scales plus the baked sky visibility.
+    float cavity=smoothstep(.34,.70,relief)*mix(.25,1.,smoothstep(.22,.55,fine.r))*pow(vSurface.r,2.2);
+    diffuseColor.rgb=mix(vec3(.018,.010,.014),rock,cavity);`,
     surfaceNormal:`vec3 rn=normalize(vRockNormal);
       vec3 rq=vReefWorld*4.0;
       vec3 perturb=vec3(0.,rx.xy*2.-1.)*w.x+vec3(ry.x*2.-1.,0.,ry.y*2.-1.)*w.y+vec3(rz.xy*2.-1.,0.)*w.z;
@@ -83,7 +127,8 @@ export async function createTerrain(scene){
       perturb+=(vec3(0.,fx)*w.x+vec3(fy.x,0.,fy.y)*w.y+vec3(fz,0.)*w.z)*.6;
       normal=normalize(mat3(viewMatrix)*normalize(rn+perturb*.9));
       // Coralline and turf are matt; only the bare raised limestone keeps a faint wet film.
-      roughnessFactor*=1.-.22*smoothstep(.7,.95,relief)*(1.-cover);`});
+      roughnessFactor*=1.-.15*smoothstep(.7,.95,relief)*(1.-cover)*(1.-turf)*(1.-algae);`,
+    specular:.2});
   const rockCompile=rockMat.onBeforeCompile;rockMat.onBeforeCompile=shader=>{rockCompile(shader);shader.uniforms.reefRelief={value:reliefMap};};
   // Keep extra shader textures visible to the common disposal path.
   rockMat.userData.extraTextures=[reliefMap];
@@ -101,39 +146,55 @@ export async function createTerrain(scene){
   const rubbleMesh=new THREE.Mesh(rubbleGeo,rockMat);rubbleMesh.receiveShadow=true;scene.add(rubbleMesh);
   return {obstacles:ROCKS,host:HOST,stations:STATIONS,rockSurface:rocks};
 }
-/** The tank's back wall, seen from inside the water. A real reef tank's rear pane is lost
- *  in the blue, so the wall is painted as the water carrying on past it: the same glow and
- *  shafts the post pass sums in front of it, integrated over a further stretch of water,
- *  so the frame fades into depth instead of stopping at a painted panel. Nothing of the
- *  enclosure itself (glass, rim, pumps) is modelled. */
-const BEYOND=14,SURFACE_REACH=8;
+/** The tank's back wall and the underside of the water surface, seen from inside the
+ *  water. A real reef tank's rear pane is lost in the blue, so the wall is painted as the
+ *  water carrying on past it: the same glow the post pass sums in front of it, integrated
+ *  over a further stretch of water, so the frame fades into depth instead of stopping at a
+ *  painted panel. A ray climbing steeply enough meets the surface's underside in that
+ *  further water, which is the rippled, lit membrane along the top of a wide frame; within
+ *  the tank the surface is real geometry at the waterline, so it writes depth and the post
+ *  pass's march, focus and haze all stop there. The two read the same surface through the
+ *  same water, so they meet without a seam. Both write zero alpha, which tells the post
+ *  pass they are open water, not a solid for its contact shading to darken where they meet.
+ *  Nothing of the enclosure itself (glass, rim, pumps) is modelled. */
+// How far off the far surface can still be made out, and its sheen.
+const SURFACE_REACH=22,SURFACE_SHEEN=[1.0,1.6,1.8];
 export function createBackdrop(scene){
-  const backMat=new THREE.ShaderMaterial({uniforms:{reefTime:{value:0}},
+  const uniforms={reefTime:waterTime,reefCaustics:causticMap};
+  const extinction=`vec3(${EXTINCTION.join(',')})`;
+  const backMat=new THREE.ShaderMaterial({uniforms,
     vertexShader:`varying vec3 p;
       void main(){p=position;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}`,
     fragmentShader:`varying vec3 p;uniform float reefTime;
-      ${extinctionGLSL}${inscatterGLSL}${surfaceGLSL}
+      ${extinctionGLSL}${causticGLSL}${inscatterGLSL}${surfaceGLSL}
       void main(){
-        // A ray climbing steeply enough meets the underside of the surface a short way past
-        // the wall, and that is the faint shimmer along the top of frame. Farther off the
-        // surface is lost in the water like everything else, so it fades out before it can
-        // draw a horizon.
-        vec3 absorb=vec3(${ABSORB.join(',')}),dir=normalize(p-cameraPosition);
-        vec3 col=reefInscatter(p,reefTime,1.)*(1.-exp(-absorb*${BEYOND}.))/absorb;
-        float reach=dir.y>0.?(${SURFACE.toFixed(3)}-p.y)/dir.y:${BEYOND}.;
-        if(reach<${SURFACE_REACH}.){
-          vec3 veil=exp(-absorb*reach);
-          vec3 under=reefInscatter(p,reefTime,1.)*(1.-veil)/absorb+veil*reefSurfaceUnderside(p+dir*reach,dir,reach,reefTime);
-          col=mix(col,under,smoothstep(${SURFACE_REACH}.,1.,reach));
+        vec3 dir=normalize(p-cameraPosition);float path=reefWaterPath(p,cameraPosition);
+        vec3 col=reefFarWater(p,dir,reefTime);
+        // The surface is lost in the water like everything else, so it fades out with
+        // distance before it can draw a horizon. Seen this far off and this flat it mirrors
+        // the bright water just under it, a cyan sheen over the blue.
+        float reach=dir.y>0.?max(0.,${SURFACE.toFixed(3)}-p.y)/dir.y:${SURFACE_REACH.toFixed(1)};
+        if(reach<${SURFACE_REACH.toFixed(1)}){
+          vec3 veil=exp(-${extinction}*reach);
+          vec3 under=reefInscatter(p+dir*reach*.5,dir,reefTime,1.)*(1.-veil)/${extinction}
+            +veil*vec3(${SURFACE_SHEEN.join(',')})*reefSurfaceUnderside(p+dir*reach,dir,reefTime);
+          col=mix(under,col,smoothstep(1.5,${SURFACE_REACH.toFixed(1)},reach));
         }
-        col*=reefTransmittance(reefWaterPath(p,cameraPosition));
-        gl_FragColor=vec4(col,1.);
-        #include <tonemapping_fragment>
-        #include <colorspace_fragment>
+        gl_FragColor=vec4(col*reefTransmittance(path),0.);
       }`});
-  const backGeo=new THREE.PlaneGeometry(44,24);backGeo.translate(0,7,TANK.back-.05);
-  const wall=new THREE.Mesh(backGeo,backMat);
-  // The wall is not an `underwater` material, so it carries the shared clock itself.
-  wall.onBeforeRender=()=>{backMat.uniforms.reefTime.value=waterTime.value;};
-  scene.add(wall);
+  const backGeo=new THREE.PlaneGeometry(44,SURFACE+1.5);backGeo.translate(0,SURFACE/2-.75,TANK.back-.05);
+  scene.add(new THREE.Mesh(backGeo,backMat));
+  const surfaceMat=new THREE.ShaderMaterial({uniforms,
+    vertexShader:`varying vec3 p;
+      void main(){p=(modelMatrix*vec4(position,1.)).xyz;gl_Position=projectionMatrix*viewMatrix*vec4(p,1.);}`,
+    fragmentShader:`varying vec3 p;uniform float reefTime;
+      ${extinctionGLSL}${causticGLSL}${inscatterGLSL}${surfaceGLSL}
+      void main(){
+        vec3 dir=normalize(p-cameraPosition);float path=reefWaterPath(p,cameraPosition);
+        gl_FragColor=vec4(reefSurfaceUnderside(p,dir,reefTime)*reefTransmittance(path),0.);
+      }`});
+  // Faces down, toward the water; from above it is never seen. It runs on a little behind
+  // the wall so the two meet in a clean intersection rather than at two edges.
+  const surfaceGeo=new THREE.PlaneGeometry(44,TANK.front-TANK.back+1);surfaceGeo.rotateX(Math.PI/2);surfaceGeo.translate(0,SURFACE,(TANK.front+TANK.back-1)/2);
+  scene.add(new THREE.Mesh(surfaceGeo,surfaceMat));
 }

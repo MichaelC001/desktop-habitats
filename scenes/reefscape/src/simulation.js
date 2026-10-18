@@ -60,8 +60,10 @@ export const SHRIMP={
   lift:.22,      // how far it will stand up on its legs to carry its belly over a lump
   stretch:.14,   // how far a leg stretches or folds to put its foot on the ground under it
   lean:.9,       // the most the body rolls with the ground across it; the legs take up the rest
+  tilt:.38,      // rad, the most it pitches nose up or down on its shoulder: on a steeper face it turns
+                 // along the slope rather than hang head-down. Only an excursion's flank tips it further
   seat:.132,     // how high the body rides over its feet: an eighth of its length, where a caridean carries itself
-  feet:[[.092,-.15,.24],[-.002,-.15,.26],[-.096,-.15,.28]], // where the three walking pairs' feet end: ahead of the seat, below it, out to each side; shrimp.js draws the legs to them
+  feet:[[.092,-.15,.13],[-.002,-.15,.145],[-.096,-.15,.16]], // where the three walking pairs' feet end: ahead of the seat, below it, out to each side, about a body's width as a caridean stands; shrimp.js draws the legs to them
   reach:1.35,    // units at which a client overhead is close enough to work on
   under:.16,     // how nearly beneath it the animal puts itself
   hold:.25,      // s a departed client goes on counting as one
@@ -97,8 +99,10 @@ export function bodyFit(x,z,yaw){
   for(const [a,d] of at)lift=Math.max(lift,d-steep*Math.abs(a));
   for(const [af,df] of at)if(af>0)for(const [ar,dr] of at)if(ar<0)lift=Math.max(lift,(dr*af-df*ar)/(af-ar));
   for(const [a,d] of at)if(a>0)low=Math.max(low,(d-lift)/a);else high=Math.min(high,(d-lift)/a);
-  const slope=(at[8][2]-at[3][2]+at[6][2]-at[5][2])/1.2;
-  return {pitch:clamp(clamp(slope,low,high),-steep,steep),lift};
+  const slope=(at[8][2]-at[3][2]+at[6][2]-at[5][2])/1.2,pitch=clamp(clamp(slope,low,high),-steep,steep);
+  // Where the steepest-flank bound overrode a floor or a ceiling the line is not clear: the
+  // tail is backed into a face, or the head into one.
+  return {pitch,lift,clear:at.every(([a,d])=>d<=lift+pitch*a+1e-6)};
 }
 // How the animal sits at (x,z) facing yaw: the body's pitch and roll as angles, how far it
 // stands up (`bodyFit`), where its seat is and where each walking foot comes to rest before
@@ -111,7 +115,7 @@ export function seatShrimp(x,z,yaw){
   // A point of the body (ahead, up, across the seat): rolled about its length, pitched about
   // its width, turned onto the heading and set on the ground under the seat.
   const place=(a,y,b)=>{const ry=y*cr+b*sr,rz=b*cr-y*sr,px=a*cp-ry*sp,py=a*sp+ry*cp;return [x+px*cx+rz*sx,h+py,z+px*cz+rz*sz];};
-  return {pitch,roll,lift:fit.lift,root:place(0,SHRIMP.seat,0),feet:SHRIMP.feet.flatMap(([a,y,b])=>[-b,b].map(side=>place(a,SHRIMP.seat+y,side)))};
+  return {pitch,roll,lift:fit.lift,clear:fit.clear,root:place(0,SHRIMP.seat,0),feet:SHRIMP.feet.flatMap(([a,y,b])=>[-b,b].map(side=>place(a,SHRIMP.seat+y,side)))};
 }
 
 export class ReefSimulation {
@@ -123,7 +127,8 @@ export class ReefSimulation {
     // Buston & Cant measured 177 adjacent-rank pairs on wild percula: a dominant ends up
     // 1.26 times its immediate subordinate's length, and 1.37 for the two smallest fish.
     // These three sizes are that ladder, so the group reads as a queue rather than a trio.
-    const initial=[[-5.15,4.18,2.1],[-2.78,3.99,1.85],[-3.54,3.85,2.35]];
+    // They start over their own host's crown, spread across it as chooseGoal spreads them.
+    const initial=[[-.706,1.02,.771],[.688,.83,.517],[.241,.69,1.024]].map(([x,y,z])=>[HOST.x+x*HOST.radius,HOST.y+y,HOST.z+.34+z*HOST.radius*.58]);
     for(let i=0;i<3;i++)this.add('clown',initial[i],[.84,.66,.48][i],i);
     for(let i=0;i<9;i++)this.add('chromis',null,.63+(i?this.random()*.13:.15),i,i%2);
     // Rank 0 is the terminal male. FishBase puts the male at 15 cm against 7 cm for the
@@ -190,8 +195,10 @@ export class ReefSimulation {
       // fish swims down through the crown, which is how it keeps its coat of host mucus
       // and, incidentally, how it ventilates the anemone.
       f.hold=r()<(f.rank?.36:.22)?2.2+r()*2.6:0;
-      const a=r()*Math.PI*2,radius=HOST.radius*(f.hold?r()*.50:.34+r()*(f.rank===0?.98:f.rank===1?.74:.50));
-      f.goal.set(HOST.x+Math.cos(a)*radius,HOST.y+(f.hold?.20+r()*.26:.66+r()*.94)-f.rank*.12,HOST.z+.34+Math.sin(a)*radius*.58);
+      // The female's goals reach the crown's rim and no further, the others' stop short of
+      // it, and none hovers more than a body length or so over the tentacles.
+      const a=r()*Math.PI*2,radius=HOST.radius*(f.hold?r()*.50:.26+r()*(f.rank===0?.74:f.rank===1?.56:.40));
+      f.goal.set(HOST.x+Math.cos(a)*radius,HOST.y+(f.hold?.20+r()*.26:.58+r()*.80)-f.rank*.12,HOST.z+.34+Math.sin(a)*radius*.58);
       f.goalTimer=f.hold||2.8+r()*4.4;return;
     }
     // A wanderer takes its next leg, then rejoins the moving shoal when the legs run out; the shoalmates that left with it keep following instead.
@@ -350,7 +357,8 @@ export class ReefSimulation {
       }else{
         f.state=f.hold?(f.kind==='clown'?'bathe':'clean'):f.kind!=='clown'?'roam':'forage';
         for(const item of this.food)if(item.active){
-          if(f.kind==='clown'&&((item.position.x-HOST.x)**2+(item.position.y-HOST.y-.7)**2+(item.position.z-HOST.z)**2)>10)continue;
+          // A clownfish takes only what drifts within a body length or two of the crown.
+          if(f.kind==='clown'&&((item.position.x-HOST.x)**2+(item.position.y-HOST.y-.7)**2+(item.position.z-HOST.z)**2)>(HOST.radius+1.5)**2)continue;
           const d=p.distanceToSquared(item.position);if(d<nearest){nearest=d;food=item;goal=item.position;}
         }
         if(food)f.state='feed';
@@ -418,7 +426,23 @@ export class ReefSimulation {
       f.roll=f.bank+(f.kind==='clown'?Math.sin(f.pectoral)*.075:0);
       if(food&&p.distanceToSquared(food.position)<(f.size*.42)**2){food.active=false;this.consumed++;f.goalTimer=0;}
     }
+    this.keepApart();
     this.stepShrimp(dt,pointer);
+  }
+  // Steering keeps fish a body's width apart nearly always, but a fish only thrusts along
+  // its heading, so two converging across each other's path could still slide through one
+  // another. Bodies whose centres come within about two thirds of their summed half-lengths
+  // are eased apart a little each step, which no one sees, rather than shown
+  // interpenetrating, which everyone does.
+  keepApart() {
+    const F=this.fish;
+    for(let i=0;i<F.length;i++)for(let j=i+1;j<F.length;j++){
+      const a=F[i],b=F[j],reach=(GAIT[a.kind].length*a.size+GAIT[b.kind].length*b.size)*.32;
+      this._delta.subVectors(a.position,b.position);const d=this._delta.length();
+      if(d>=reach||d<1e-6)continue;
+      const push=Math.min((reach-d)/2,.012);
+      a.position.addScaledVector(this._delta,push/d);b.position.addScaledVector(this._delta,-push/d);
+    }
   }
   // A cleaner shrimp lives on one rock shoulder. Most of its day is spent standing over it
   // advertising — whipping the long white antennae, which precedes four cleans in five, and
@@ -438,8 +462,8 @@ export class ReefSimulation {
     // legs allow, and where every walking foot, seated exactly as the model will be drawn
     // (`seatShrimp`), can still fold down to its own ground — so a tail never runs into the
     // rock behind, a head into the one ahead nor a foot into the one beside, turning or
-    // stepping.
-    const fits=(x,z,yaw)=>{const seat=seatShrimp(x,z,yaw);return seat.lift<=SHRIMP.lift&&seat.feet.every(([fx,fy,fz])=>supportHeight(fx,fz)-fy<=SHRIMP.stretch);};
+    // stepping. At home the body never pitches past what a shrimp carries itself at.
+    const fits=(x,z,yaw,out=false)=>{const seat=seatShrimp(x,z,yaw);return seat.lift<=SHRIMP.lift&&seat.clear&&(out||Math.abs(seat.pitch)<=SHRIMP.tilt)&&seat.feet.every(([fx,fy,fz])=>supportHeight(fx,fz)-fy<=SHRIMP.stretch);};
     // And a foot only goes down where the animal can stand. On the shoulder that is within
     // its working range, never far below the station and never on ground too steep; on an
     // excursion it is anywhere within roam, down a flank it can climb.
@@ -448,7 +472,7 @@ export class ReefSimulation {
       const h=supportHeight(x,z);
       if(!out&&Math.abs(h-supportHeight(s.home.x,s.home.z))>SHRIMP.drop)return false;
       if(Math.hypot(supportHeight(x+.12,z)-supportHeight(x-.12,z),supportHeight(x,z+.12)-supportHeight(x,z-.12))>(out?SHRIMP.flank:SHRIMP.grade)*.24)return false;
-      return fits(x,z,yaw);
+      return fits(x,z,yaw,out);
     };
     // A leg is walked at the animal's own pace with time to square up first. A route is a spot
     // between rmin and rmax of a centre that a straight walk from here reaches with every
@@ -474,7 +498,7 @@ export class ReefSimulation {
       // Turning sweeps the tail and the claws through a body's length of ground, so a turn
       // is tested like a step, and one the rock refuses is not made.
       let turn=clamp(off,-SHRIMP.turn*dt,SHRIMP.turn*dt);
-      if(fits(s.position.x,s.position.z,s.yaw+turn))s.yaw+=turn;else turn=0;
+      if(fits(s.position.x,s.position.z,s.yaw+turn,s.out>0))s.yaw+=turn;else turn=0;
       let gone=0;
       if(Math.abs(off)<SHRIMP.square&&range>near){
         gone=Math.min(SHRIMP.speed*dt,range-near);

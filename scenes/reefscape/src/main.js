@@ -11,7 +11,7 @@ import { createParticles } from './particles.js';
 import { ReefSimulation, FIXED_STEP } from './simulation.js';
 import { views } from './views.js';
 import { createFrameLoop } from '../../shared/frame-loop.js';
-import { waterTime, LAMP, LAMP_RANGE } from './water.js';
+import { waterTime, LAMP, LAMP_RANGE, ACTINIC, createEnvironment, createCaustics } from './water.js';
 
 const canvas=document.querySelector('#scene'),stage=document.querySelector('#stage'),loading=document.querySelector('#loading');
 const params=new URLSearchParams(location.search),isHost=document.documentElement.dataset.motion==='host';
@@ -32,24 +32,23 @@ window.scenePower=battery=>{const next=Boolean(battery);if(next===onBattery)retu
 
 async function start(){
   const renderer=new THREE.WebGLRenderer({canvas,antialias:false,alpha:false,powerPreference:'low-power',preserveDrawingBuffer:false});
-  renderer.setPixelRatio(1);renderer.outputColorSpace=THREE.SRGBColorSpace;renderer.toneMapping=THREE.ACESFilmicToneMapping;renderer.toneMappingExposure=1.08;
+  renderer.setPixelRatio(1);renderer.outputColorSpace=THREE.SRGBColorSpace;renderer.toneMapping=THREE.NeutralToneMapping;renderer.toneMappingExposure=1.75;
   renderer.shadowMap.enabled=true;renderer.shadowMap.needsUpdate=true;renderer.shadowMap.type=THREE.PCFSoftShadowMap;renderer.info.autoReset=false;
-  const scene=new THREE.Scene();scene.background=new THREE.Color('#04101d');
-  // Reef LEDs: a warm-white key from overhead, so the tops of rock, coral and fish catch
-  // the light and everything under an edge falls into the water's blue, with a violet
-  // actinic wash from above. The ground half of the hemisphere stands in for the bounce off
-  // the bright aragonite bed, so the shaded side of a coral branch reads as tissue in shadow
-  // rather than a black stick. The sky half is the water column itself, deep blue, and kept
-  // low: what the lamp does not reach stays dark.
-  scene.add(new THREE.HemisphereLight('#3c56c0','#4a4636',.42));
-  const sun=new THREE.DirectionalLight('#ffdfba',4.3);sun.position.set(LAMP.x,LAMP.y,LAMP.z).multiplyScalar(LAMP_RANGE);sun.target.position.set(0,0,0);sun.castShadow=true;
+  const scene=new THREE.Scene();scene.background=new THREE.Color('#020a1a');
+  // A reef LED bank run the way most reef keepers run one: a neutral-cool white channel
+  // from overhead, so the tops of rock, coral and fish catch light that shows their real
+  // colours, with royal-blue actinics that deepen the blue a little and make the corals
+  // fluoresce. The hemisphere stands in for light the water and bed send back: clear blue
+  // from the water column above, a warm bounce off the aragonite below, so shaded sides
+  // read as tissue in shadow rather than a black stick.
+  scene.add(new THREE.HemisphereLight('#3d7fd6','#8a7c62',.5));
+  const sun=new THREE.DirectionalLight('#f2f5ff',4.2);sun.position.set(LAMP.x,LAMP.y,LAMP.z).multiplyScalar(LAMP_RANGE);sun.target.position.set(0,0,0);sun.castShadow=true;
   sun.shadow.mapSize.set(1536,1536);Object.assign(sun.shadow.camera,{left:-12,right:12,top:10,bottom:-9,near:1,far:43});sun.shadow.bias=-.0007;sun.shadow.normalBias=.018;sun.shadow.radius=2;sun.shadow.intensity=.86;
   scene.add(sun,sun.target);
-  const actinic=new THREE.DirectionalLight('#4f6dff',.78);actinic.position.set(3,12,-2);scene.add(actinic);
-  const bounce=new THREE.DirectionalLight('#7f8fd0',.18);bounce.position.set(3,6,8);scene.add(bounce);
-  // The lamp's light scattered forward by the water behind a subject comes back toward the
-  // camera from the far side: a cool rim on the backs of fish and along the crests of rock.
-  const rim=new THREE.DirectionalLight('#7fc4ff',1.1);rim.position.set(1.5,6,-9);scene.add(rim);
+  const actinic=new THREE.DirectionalLight(new THREE.Color().setRGB(...ACTINIC.color,THREE.LinearSRGBColorSpace),ACTINIC.intensity);actinic.position.set(ACTINIC.x,ACTINIC.y,ACTINIC.z).multiplyScalar(LAMP_RANGE);scene.add(actinic);
+  // The lamp's spill off the front of the hood, faint, so faces turned to the glass are
+  // not left to the ambient alone.
+  const spill=new THREE.DirectionalLight('#c2d2f2',.2);spill.position.set(3,6,8);scene.add(spill);
   // The key light's shadow map, read by the motes so they go dark where the lamp is
   // blocked. The texture only exists once the first beauty pass has drawn it, so render()
   // fills it in.
@@ -59,7 +58,7 @@ async function start(){
   // ?view=custom&camera=x,y,z,tx,ty,tz,fov
   if(capture&&params.has('camera')){const c=params.get('camera').split(',').map(Number);if(c.length>=6&&c.every(Number.isFinite))views.custom={position:c.slice(0,3),target:c.slice(3,6),fov:c[6]||30};}
   let view=params.get('view')||'wide';if(!views[view])view='wide';
-  const postRight=new THREE.Vector3(),postUp=new THREE.Vector3(),postForward=new THREE.Vector3();
+  const focusPoint=new THREE.Vector3(),postRight=new THREE.Vector3(),postUp=new THREE.Vector3(),postForward=new THREE.Vector3();
   // Declared here, but only ever called once the post material below exists.
   function syncPostCamera(){
     camera.updateMatrixWorld();const e=camera.matrixWorld.elements,tan=Math.tan(camera.fov*Math.PI/360);
@@ -68,33 +67,35 @@ async function start(){
     post.uniforms.rayX.value.copy(postRight).multiplyScalar(tan*camera.aspect);
     post.uniforms.rayY.value.copy(postUp).multiplyScalar(tan);
     post.uniforms.rayZ.value.copy(postForward);
+    // Focus on the view's subject, measured along the view axis as the depth buffer is.
+    post.uniforms.focus.value=postForward.dot(focusPoint.set(...views[view].target).sub(camera.position));
   }
   function applyView(name){const v=views[name];view=name;camera.position.set(...v.position);camera.lookAt(...v.target);camera.fov=v.fov;camera.updateProjectionMatrix();syncPostCamera();}
-  // The beauty pass lands in an HDR target; a short screen-space pass adds contact occlusion
-  // where rock meets sand and coral meets rock, then a light vignette, before tone mapping.
-  const { target, post, postScene, postCamera } = createComposite(camera,shadow);
+  // The beauty pass lands in an HDR target; one screen-space pass adds contact occlusion,
+  // the water's own glow, a mild lens (defocus, lateral colour, bloom, vignette), the
+  // Khronos neutral curve, which rolls highlights off toward white while keeping hues true
+  // below them (ACES pushes the actinic blue to a flat saturated primary), and fine grain.
+  const { target, post, postScene, postCamera, setQuality:setPostQuality } = createComposite(camera,shadow);
   applyView(view);
-  const envData=new Uint8Array(128*64*4);
-  for(let y=0;y<64;y++)for(let x=0;x<128;x++){
-    const top=1-y/63,glow=Math.exp(-(((top-.86)/.13)**2));const i=(y*128+x)*4;
-    envData[i]=5+glow*186;envData[i+1]=7+glow*208;envData[i+2]=24+glow*231;envData[i+3]=255;
-  }
-  const environment=new THREE.DataTexture(envData,128,64);environment.mapping=THREE.EquirectangularReflectionMapping;environment.colorSpace=THREE.SRGBColorSpace;environment.needsUpdate=true;scene.environment=environment;scene.environmentIntensity=.30;
+  const environment=createEnvironment();scene.environment=environment;scene.environmentIntensity=1;
+  // The caustic map every lit surface and shaft reads; drawn first in each frame.
+  const caustics=createCaustics();
   createBackdrop(scene);
   const {rockSurface}=await createTerrain(scene);
-  await createCorals(scene);
+  const corals=await createCorals(scene);
   const anemone=createAnemone(scene);
-  const rockPrepass=new THREE.Scene();
   // Resolve porous rock depth before its expensive material. Hidden inner surfaces
-  // then fail the depth test without sampling the triplanar texture layers.
-  const rockDepthMaterial=new THREE.MeshBasicMaterial({colorWrite:false});
-  rockPrepass.add(new THREE.Mesh(rockSurface.geometry,rockDepthMaterial));
+  // then fail the depth test without sampling the triplanar texture layers. It is drawn
+  // first in the beauty pass itself rather than as a pass of its own, because every
+  // render into the target resolves its multisampling and rebuilds its mipmaps.
+  const rockDepth=new THREE.Mesh(rockSurface.geometry,new THREE.MeshBasicMaterial({colorWrite:false}));
+  rockDepth.renderOrder=-1;scene.add(rockDepth);
   const simulation=new ReefSimulation();
   const fishSchool=createFishSchool(scene,simulation);
   const shrimp=createShrimp(scene,simulation),particles=createParticles(scene,simulation,shadow);
   function sync(dt){
     waterTime.value=simulation.time;
-    fishSchool.update();
+    fishSchool.update(camera);
     shrimp.update();particles.update(dt);
   }
   let loop=null,accumulator=0,frames=0,zeroSize=false;
@@ -104,15 +105,9 @@ async function start(){
   function render(){
     if(contextLost||disposed||document.hidden)return;
     renderer.info.reset();
+    caustics.render(renderer);
     renderer.setRenderTarget(target);
-    renderer.clear();
-    renderer.autoClear=false;
-    renderer.render(rockPrepass,camera);
-    // A color background forces a clear even with autoClear disabled.
-    renderer.autoClearDepth=false;
     renderer.render(scene,camera);
-    renderer.autoClear=true;
-    renderer.autoClearDepth=true;
     shadow.reefShadowMap.value=sun.shadow.map.texture;
     renderer.setRenderTarget(null);
     renderer.render(postScene,postCamera);
@@ -147,7 +142,7 @@ async function start(){
     const wasZeroSize=zeroSize;
     zeroSize=!(width>0&&height>0);
     if(zeroSize){restart();return;}
-    anemone.setQuality(active);
+    anemone.setQuality(active);corals.setQuality(active);caustics.setQuality(active);fishSchool.setQuality(active);setPostQuality(active);
     ratio=renderScale(quality,devicePixelRatio,onBattery)*autoScale;
     const {width:w,height:h}=framebufferSize(width,height,ratio,renderer.capabilities.maxTextureSize,preset.pixels);ratio=w/width;renderer.setSize(w,h,false);target.setSize(w,h);post.uniforms.size.value.set(w,h);post.uniforms.aoRadiusScale.value=h/972;
     camera.aspect=width/height;
@@ -215,7 +210,7 @@ async function start(){
     loop.setHidden(true);if(event.persisted)return;disposed=true;loop.dispose();observer.disconnect();
     const geometries=new Set(),materials=new Set(),textures=new Set();scene.traverse(object=>{if(object.geometry)geometries.add(object.geometry);if(object.material)(Array.isArray(object.material)?object.material:[object.material]).forEach(m=>materials.add(m));});
     for(const m of materials){for(const value of Object.values(m))if(value?.isTexture)textures.add(value);for(const tex of m.userData?.extraTextures||[])textures.add(tex);m.dispose();}
-    geometries.forEach(g=>g.dispose());textures.forEach(t=>t.dispose());sun.shadow.map?.dispose();environment.dispose();target.dispose();post.dispose();rockDepthMaterial.dispose();renderer.dispose();
+    geometries.forEach(g=>g.dispose());textures.forEach(t=>t.dispose());sun.shadow.map?.dispose();environment.dispose();caustics.dispose();target.dispose();post.dispose();renderer.dispose();
   });
   addEventListener('pageshow',event=>{if(event.persisted){resize(false);render();restart();}});
 }

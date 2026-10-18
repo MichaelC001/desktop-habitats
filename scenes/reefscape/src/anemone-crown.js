@@ -2,15 +2,21 @@ import { randomGenerator, clamp } from './math.js';
 
 export const REACH=.90;
 const GOLDEN=Math.PI*(3-Math.sqrt(5)),ROOT_RADIUS=.24;
+// Tentacles on a host of unit scale; a crown grows with the disc's area and a little more.
+export const HOST_DENSITY=180;
+// The host's column height in units of its scale: short, most of it in the rock.
+export const HOST_COLUMN=.30;
 
-// The host deliberately retains its authored silhouette. Compact is an explicit shape
-// choice, not a claim that every small/juvenile anemone has short tentacles. Real species
-// and expansion states differ. All lengths here are in tank units.
+// The host is a bubble-tip anemone (Entacmaea quadricolor) in full expansion: a dense
+// crown of several hundred slender tentacles of uneven length standing up and out from
+// the disc. Compact is an explicit shape choice for the small specimens, not a claim that
+// every juvenile has short tentacles. All lengths here are in tank units.
 export function crownProfile(spec){
   const S=spec.radius/REACH,compact=spec.form==='compact';
-  const cycles=compact?(S>.65?[6,6,12,24,48]:S>.40?[6,6,12,24]:[6,6,12]):null;
-  return {S,compact,rim:compact?.53:.36,height:compact?.43:.66,
-    count:compact?cycles.reduce((a,b)=>a+b,0):Math.round(110*Math.pow(S,1.3)),cycles};
+  // Each cycle doubles the last, as an anemone's tentacle cycles do, densely enough to hide the disc.
+  const cycles=compact?(S>.65?[10,10,20,40,80]:S>.40?[8,8,16,32]:[8,8,16]):null;
+  return {S,compact,rim:compact?.53:.36,height:compact?.43:HOST_COLUMN,
+    count:compact?cycles.reduce((a,b)=>a+b,0):Math.round(HOST_DENSITY*Math.pow(S,1.3)),cycles};
 }
 
 export function buildCrown(spec,index=0){
@@ -21,8 +27,12 @@ export function buildCrown(spec,index=0){
     for(let i=0;i<count;i++){
       const rr=Math.sqrt(ROOT_RADIUS*ROOT_RADIUS+(1-ROOT_RADIUS*ROOT_RADIUS)*(i+.5)/count),ring=(rr-ROOT_RADIUS)/(1-ROOT_RADIUS);
       const angle=i*GOLDEN+(rng()-.5)*.44,radius=clamp(rr+(rng()-.5)*.10,ROOT_RADIUS*.9,1);
-      const length=.48*Math.pow(S,1.15)*(.88+.50*ring)*(.86+.28*rng()),girth=.036*Math.pow(S,.70)*(.85+.30*rng());
-      const tilt=.25+.75*Math.pow(ring,1.2),curl=(.20+.80*rng())*(.60+.75*ring);
+      // Short, thick tentacles of uneven length, as in a living crown where some are
+      // extending and others contracting: a mound of bulbs, not a burst of long fingers.
+      // The outer rings are no longer than the inner; they lean out and droop instead.
+      const length=.40*Math.pow(S,1.15)*(.92-.12*ring)*(.62+.60*rng()),girth=.025*Math.pow(S,.90)*(.70+.60*rng()**1.5);
+      // The outer rings droop over the rim and hide the column; a few tentacles hook sharply.
+      const tilt=.18+.95*Math.pow(ring,1.2)+(rng()-.5)*.24,curl=(.10+.55*rng())*(.55+.75*ring)+(rng()<.12?.6:0);
       roots.push({angle,radius,ring,length,girth,tilt,curl,tone:rng(),lag:rng(),seed:rng(),flex:1});
     }
   }else{
