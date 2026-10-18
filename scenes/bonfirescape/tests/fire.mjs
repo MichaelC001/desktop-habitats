@@ -48,10 +48,12 @@ const live = fire => { let n = 0; for (let i = 0; i < SPARKS; i++) if (fire.spar
 }
 {
   // Left alone, the fire holds for a while, then sinks to embers; fanning brings it back.
-  const fire = run(6, 30);
+  const fire = run(6, 59);
   assert(fire.state.vigor > 0.95, 'a fresh fire burns at full strength for its first minute');
-  for (let i = 0; i < Math.round(300 / FIXED_STEP); i++) fire.step(FIXED_STEP);
-  assert(fire.state.vigor < 0.05 && fire.state.energy < 0.3, 'after a few minutes only embers are left');
+  for (let i = 0; i < Math.round(61 / FIXED_STEP); i++) fire.step(FIXED_STEP);
+  assert(Math.abs(fire.state.vigor - 0.5) < 0.05, `at two minutes it burns at half strength (${fire.state.vigor.toFixed(2)})`);
+  for (let i = 0; i < Math.round(120 / FIXED_STEP); i++) fire.step(FIXED_STEP);
+  assert(fire.state.vigor < 0.05 && fire.state.energy < 0.3, 'at four minutes only embers are left');
   const embers = live(fire);
   assert(fire.state.glow > 0.7, 'embers still glow');
   for (let i = 0; i < Math.round(3 / FIXED_STEP); i++) { if (i % 4 === 0) fire.fan(0.01); fire.step(FIXED_STEP); }

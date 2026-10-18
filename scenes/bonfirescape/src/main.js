@@ -3,7 +3,7 @@ import { QUALITY_PRESETS as presets, qualityName, activeQuality, frameRate, fram
 import { installControls, preferredQuality, reportSceneError } from '../../shared/controls.js';
 import { createFrameLoop } from '../../shared/frame-loop.js';
 import { randomGenerator } from '../../shared/random.js';
-import { createFire, FIXED_STEP } from './fire.js';
+import { createFire, flameFor, FIXED_STEP, FUEL } from './fire.js';
 import { createRenderer } from './render.js';
 
 const canvas = document.querySelector('#scene'), stage = document.querySelector('#stage'), loading = document.querySelector('#loading');
@@ -11,7 +11,7 @@ const params = new URLSearchParams(location.search), isHost = document.documentE
 const capture = params.has('capture');
 if (capture) document.body.classList.add('clean', 'capture');
 // Fuel added per metre the cursor sweeps near the fire: a few seconds of fanning revives it.
-const FAN = 0.45;
+const FAN = 0.585;
 // The flame is marched per pixel; past this many the frame rate suffers more than the picture gains.
 const MAX_PIXELS = 4.2e6;
 let quality = preferredQuality(params);
@@ -94,7 +94,7 @@ async function start() {
     const px = camera.position.x + ray.x * t, py = camera.position.y + ray.y * t;
     const dx = -px, dy = 0.6 - py, d = Math.hypot(dx, dy);
     const near = Math.exp(-d * d / 0.8);
-    fire.setCursor(d > 1e-3 ? [dx / d * near * 1.2, 0] : null);
+    fire.setCursor(d > 1e-3 ? [dx / d * near * 1.56, 0] : null);
     // Metres the cursor swept through near the fire, capped so a jump in position is not a gust.
     if (last && running()) fire.fan(Math.min(0.3, Math.hypot(px - last[0], py - last[1])) * near * FAN);
     last = [px, py];
@@ -122,7 +122,7 @@ async function start() {
     for (let left = seconds; left > 1e-7; left -= FIXED_STEP) fire.step(Math.min(FIXED_STEP, left));
   };
   advance(4);
-  if (capture && params.has('fuel')) { fire.state.fuel = Math.min(1.4, Math.max(0, Number(params.get('fuel')) || 0)); fire.state.vigor = Math.min(1, fire.state.fuel); }
+  if (capture && params.has('fuel')) { fire.state.fuel = Math.min(FUEL.full, Math.max(0, Number(params.get('fuel')) || 0)); fire.state.vigor = flameFor(fire.state.fuel); }
   if (capture) {
     const stirAt = Number(params.get('stir'));
     const total = Math.min(120, Math.max(0, Number(params.get('time')) || 0));

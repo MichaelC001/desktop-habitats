@@ -7,9 +7,12 @@ export const SPARK_FLOATS = 12;      // [x, y, z, -], [previous x, y, z, -], [he
 export const FIRE = { base: [0, 0.33, 0], radius: 0.32 };
 // The flames move at this fraction of their natural pace: slower reads as calmer.
 export const FLICKER = 0.42;
-// Fuel above 1 keeps the fire at full strength; it burns away at this many units a second,
-// so a fire left alone holds for a while, then sinks to embers over a few minutes.
-export const FUEL = { full: 1.4, burn: 1 / 200 };
+// Fuel above 1 keeps the fire at full strength; it burns away at this many units a second.
+// Left alone, the fire holds for a minute, is at half strength at two and out at four.
+export const FUEL = { full: 4 / 3, burn: 1 / 180 };
+// How hard the flames burn on a given amount of fuel: the curve brings half strength forward
+// to two minutes, so the fire sinks quickly at first, then lingers low.
+export const flameFor = fuel => Math.pow(Math.min(1, fuel), 1.82);
 
 const TAU = Math.PI * 2;
 
@@ -85,7 +88,7 @@ export function createFire({ random }) {
     // The fire burns down unless it is fed; the flames follow the fuel, quickly as it catches,
     // slowly as it dies.
     state.fuel = Math.max(0, state.fuel - dt * FUEL.burn);
-    const target = Math.min(1, state.fuel);
+    const target = flameFor(state.fuel);
     state.vigor += (target - state.vigor) * Math.min(1, dt * (target > state.vigor ? 0.9 : 0.25));
     const f = t * FLICKER;
     state.energy = (0.2 + 0.8 * state.vigor) * (1 + 0.08 * wobble(f * 1.9, 0.4) + 0.05 * wobble(f * 5.3, 3.1)) * (1 + 0.4 * state.boost);
